@@ -3,6 +3,8 @@ name: Android APK build
 # APK builds must be started manually by the user.
 # Do not build on push or pull requests.
 on:
+  push:
+    branches: ["resimanage-2-apk-candidate"]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +15,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run regression tests
+        env:
+          ROTATION_SECRET: ci-test-secret
+        run: pytest -q
+
   build-debug-apk:
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

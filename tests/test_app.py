@@ -1,6 +1,8 @@
 import hashlib
 from flask.testing import FlaskClient
 import io
+import sqlite3
+from datetime import timedelta
 import re
 import zipfile
 import sys
@@ -38,6 +40,25 @@ def setup_client(tmp_path, monkeypatch):
 
 def login(client):
     return client.post("/login", data={"password": "test-strong-password-2026"}, follow_redirects=True)
+
+
+
+def test_internal_navigation_is_grouped_responsive_and_marks_current_page(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert b'class="rt-app-shell"' in response.data
+    assert b'aria-label="Main navigation"' in response.data or b'aria-label="\xd8\xa7\xd9\x84\xd8\xaa\xd9\x86\xd9\x82\xd9\x84 \xd8\xa7\xd9\x84\xd8\xb1\xd8\xa6\xd9\x8a\xd8\xb3\xd9\x8a"' in response.data
+    assert b'href="/leave"' in response.data
+    assert b'href="/external-rotations"' in response.data
+    assert "التربصات والتخطيط".encode() in response.data or b'Rotations &amp; planning' in response.data or b'Rotations & planning' in response.data
+    assert b'class="nav-home is-active"' in response.data
+    assert b'grid-template-columns:260px minmax(0,1fr)' in response.data
+    assert b'@media(max-width:680px)' in response.data
+    residents = client.get("/residents")
+    assert residents.status_code == 200
+    assert b'href="/residents" class="is-active"' in residents.data
 
 
 def test_login_page_and_language_selector(tmp_path, monkeypatch):
@@ -302,6 +323,54 @@ def test_first_year_progression_requires_every_component_at_least_ten(tmp_path, 
         assert conn.execute("SELECT year FROM residents WHERE id=?", (fail_id,)).fetchone()[0] == 1
 
 
+def test_first_year_progression_does_not_advance_inactive_resident(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,1,'inactive')",
+            ("InactivePass", "Resident"),
+        )
+        rid = conn.execute(
+            "SELECT id FROM residents WHERE surname='InactivePass'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO exam_records(resident_id,study_year,module,theory,practical) VALUES(?,1,?,?,?)",
+            (rid, "Module A", 12, 12),
+        )
+        conn.commit()
+
+    response = client.post(
+        "/exams",
+        data={
+            "action": "evaluate_first_year",
+            "resident": str(rid),
+            "study_year": "1",
+            "all_modules_confirmed": "yes",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "resident is inactive".encode() in response.data
+    with rotation_app.db() as conn:
+        resident = conn.execute(
+            "SELECT year,status FROM residents WHERE id=?", (rid,)
+        ).fetchone()
+        assert (resident["year"], resident["status"]) == (1, "inactive")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='resident.year_advanced' AND details LIKE ?",
+            (f"%resident_id={rid};%",),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE details LIKE ?",
+            ("%InactivePass Resident — first-year exams%",),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='exam.first_year_evaluated' AND details LIKE ?",
+            (f"%resident_id={rid};%",),
+        ).fetchone()[0] == 0
+
+
 def test_dems_archive_keeps_resident_and_history(tmp_path, monkeypatch):
     client = setup_client(tmp_path, monkeypatch)
     login(client)
@@ -353,6 +422,89 @@ def test_standard_user_cannot_access_super_admin_pages(tmp_path, monkeypatch):
     assert client.get("/settings").status_code == 403
     assert client.get("/dems").status_code == 403
     assert client.get("/audit").status_code == 403
+
+def test_standard_user_cannot_create_residents(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    client.post(
+        "/users",
+        data={
+            "username": "standard-operator",
+            "password": "standard-operator-password-2026",
+            "role": "user",
+        },
+        follow_redirects=True,
+    )
+    with client.session_transaction() as sess:
+        sess["user"] = "standard-operator"
+        sess["role"] = "user"
+
+    response = client.post(
+        "/residents",
+        data={
+            "surname": "Unauthorized",
+            "firstname": "Resident",
+            "year": "2",
+            "phone": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 403
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM residents WHERE surname='Unauthorized'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='resident.created' AND details='Unauthorized Resident'"
+        ).fetchone()[0] == 0
+
+
+def test_standard_user_cannot_record_or_change_exam_marks(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    client.post(
+        "/users",
+        data={
+            "username": "exam-operator",
+            "password": "exam-operator-password-2026",
+            "role": "user",
+        },
+        follow_redirects=True,
+    )
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,1)",
+            ("ProtectedExam", "Resident"),
+        )
+        rid = conn.execute(
+            "SELECT id FROM residents WHERE surname='ProtectedExam'"
+        ).fetchone()[0]
+        conn.commit()
+    with client.session_transaction() as sess:
+        sess["user"] = "exam-operator"
+        sess["role"] = "user"
+
+    response = client.post(
+        "/exams",
+        data={
+            "action": "record",
+            "resident": str(rid),
+            "study_year": "1",
+            "module": "Unauthorized module",
+            "theory": "20",
+            "practical": "20",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 403
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM exam_records WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='exam.recorded'"
+        ).fetchone()[0] == 0
+
 
 def test_backup_and_restore_preserve_database_and_resident_photos(tmp_path, monkeypatch):
     client = setup_client(tmp_path, monkeypatch)
@@ -434,7 +586,11 @@ def test_uploaded_resident_photo_is_stored_and_served_safely(tmp_path, monkeypat
     with rotation_app.db() as conn:
         conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,1)", ("Photo", "Resident"))
         rid = conn.execute("SELECT id FROM residents WHERE surname='Photo'").fetchone()[0]
-    png = b"\x89PNG\r\n\x1a\n" + b"test"
+    from PIL import Image
+    image = Image.new("RGB", (8, 8), (30, 120, 180))
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, format="PNG")
+    png = image_buffer.getvalue()
     response = client.post("/profile/" + str(rid), data={
         "birth_place":"", "birth_date":"", "phone":"",
         "photo":(io.BytesIO(png),"portrait.png")
@@ -894,3 +1050,1031 @@ def test_year_progression_is_not_approved_if_either_official_rejects(tmp_path, m
         decision = conn.execute("SELECT decision FROM decisions WHERE details LIKE '%Reject Resident — year 3%'").fetchone()
         assert decision[0] == "Rejected by official vote"
 
+
+
+def test_dems_archive_is_blocked_if_either_official_rejects(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    for username in ("benhocine", "drdris"):
+        client.post("/users", data={
+            "username": username,
+            "password": "strong-test-password-2026",
+            "role": "super_admin",
+        }, follow_redirects=True)
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,4,'active')",
+            ("DEMSReject", "Resident"),
+        )
+        rid = conn.execute(
+            "SELECT id FROM residents WHERE surname='DEMSReject'"
+        ).fetchone()[0]
+        conn.commit()
+
+    for username, outcome in (("benhocine", "approve"), ("drdris", "reject")):
+        with client.session_transaction() as sess:
+            sess["user"] = username
+            sess["role"] = "super_admin"
+        response = client.post("/dems", data={
+            "resident": str(rid),
+            "success_date": "2026-10-15",
+            "outcome": outcome,
+            "reason": username + " reviewed the DEMS result",
+        }, follow_redirects=True)
+        assert response.status_code == 200
+
+    with rotation_app.db() as conn:
+        resident = conn.execute(
+            "SELECT status,dems_status FROM residents WHERE id=?", (rid,)
+        ).fetchone()
+        assert tuple(resident) == ("active", "")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dems_archive WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dems_votes WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='dems.vote_rejected'"
+        ).fetchone()[0] == 1
+        decision = conn.execute(
+            "SELECT decision FROM decisions WHERE details LIKE '%DEMSReject Resident — DEMS%'"
+        ).fetchone()
+        assert decision is not None
+        assert decision["decision"] == "Not approved by official vote"
+
+
+def test_assignment_page_has_priority_filters_and_clear_conflict_feedback(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,?,?)", ("Priority", "Four", 4, "active"))
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,?,?)", ("Search", "One", 1, "active"))
+        conn.commit()
+    response = client.get("/assign")
+    assert response.status_code == 200
+    assert b'id="assignment-search"' in response.data
+    assert b'id="assignment-year-filter"' in response.data
+    assert b'value="4"' in response.data and ("السنة".encode() in response.data or b'Year 4' in response.data)
+    assert "تخطيط التربصات وتعيين المقيمين".encode() in response.data or b'Rotation planning &amp; resident assignment' in response.data or b'Rotation planning & resident assignment' in response.data
+    assert b'rt-assignment-stats' in response.data
+    assert b'rt-assignment-notice' in response.data
+    assert b'External rotation conflict' in response.data
+    assert b'rt-assignment-table' in response.data
+
+def test_inactive_core_terrain_does_not_block_repeat_eligibility(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4)",
+            ("InactiveCore", "Resident"),
+        )
+        rid = conn.execute(
+            "SELECT id FROM residents WHERE surname='InactiveCore'"
+        ).fetchone()[0]
+        target = conn.execute(
+            "SELECT id FROM terrains WHERE name='Réanimation chirurgicale'"
+        ).fetchone()[0]
+        inactive = conn.execute(
+            "SELECT id FROM terrains WHERE name='Urologie'"
+        ).fetchone()[0]
+        period_id = conn.execute(
+            "SELECT id FROM periods ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        year_label = conn.execute(
+            "SELECT year_label FROM periods WHERE id=?", (period_id,)
+        ).fetchone()[0]
+        conn.execute("UPDATE terrains SET active=0 WHERE id=?", (inactive,))
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,2)",
+            (year_label, target, period_id),
+        )
+        conn.execute(
+            "INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",
+            (rid, target, year_label, "01 Fév - 30 Avr", "2026-04-30"),
+        )
+        conn.execute(
+            """
+            INSERT INTO history(resident_id,terrain_id,year_label,period,date_done)
+            SELECT ?, id, ?, 'historique', '2026-04-30'
+            FROM terrains
+            WHERE active=1 AND kind IN ('mandatory','basic') AND id<>?
+            """,
+            (rid, year_label, target),
+        )
+
+    with rotation_app.app.test_request_context("/"):
+        with rotation_app.db() as conn:
+            allowed, message, status = rotation_app.check(
+                conn, rid, target, period_id, year_label
+            )
+
+    assert allowed is True
+    assert status == "confirmed"
+    assert "يمكن التكرار" in message
+
+def test_pending_assignment_cannot_be_approved_after_terrain_deactivation(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,2)", ("StaleTerrain", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='StaleTerrain'").fetchone()[0]
+        conn.execute("INSERT INTO terrains(name,kind,mandatory_year) VALUES(?,?,3)", ("Pending Deactivated Terrain", "mandatory"))
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Pending Deactivated Terrain'").fetchone()[0]
+        period = conn.execute("SELECT id,year_label FROM periods ORDER BY id LIMIT 1").fetchone()
+        conn.execute("INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)", (period["year_label"], tid, period["id"]))
+    client.post("/assign", data={"resident":str(rid),"terrain":str(tid),"period":str(period["id"])})
+    with rotation_app.db() as conn:
+        aid = conn.execute("SELECT id FROM assignments WHERE resident_id=? AND status='pending'", (rid,)).fetchone()[0]
+        conn.execute("UPDATE terrains SET active=0 WHERE id=?", (tid,))
+    response = client.post("/decisions", data={"aid":str(aid),"outcome":"approve","reason":"Review stale request"}, follow_redirects=True)
+    assert response.status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT status FROM assignments WHERE id=?", (aid,)).fetchone()[0] == "pending"
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='assignment.override_approved'").fetchone()[0] == 0
+
+
+def test_pending_assignment_cannot_be_approved_during_new_external_overlap(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,2)", ("StaleExternal", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='StaleExternal'").fetchone()[0]
+        conn.execute("INSERT INTO terrains(name,kind,mandatory_year) VALUES(?,?,3)", ("Pending External Terrain", "mandatory"))
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Pending External Terrain'").fetchone()[0]
+        period = conn.execute("SELECT id,year_label,name FROM periods ORDER BY id LIMIT 1").fetchone()
+        conn.execute("INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)", (period["year_label"], tid, period["id"]))
+    client.post("/assign", data={"resident":str(rid),"terrain":str(tid),"period":str(period["id"])})
+    start_day, end_day = rotation_app.rotation_period_bounds(period["year_label"], period["name"])
+    with rotation_app.db() as conn:
+        aid = conn.execute("SELECT id FROM assignments WHERE resident_id=? AND status='pending'", (rid,)).fetchone()[0]
+        conn.execute(
+            "INSERT INTO external_rotations(resident_id,supervisor,destination,hospital,country,rotation_type,start_date,end_date,status) VALUES(?,?,?,?,?,?,?,?,?)",
+            (rid,"Dr Test","Paris","CHU Test","France","Observation",start_day.isoformat(),end_day.isoformat(),"active"),
+        )
+    response = client.post("/decisions", data={"aid":str(aid),"outcome":"approve","reason":"Review external conflict"}, follow_redirects=True)
+    assert response.status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT status FROM assignments WHERE id=?", (aid,)).fetchone()[0] == "pending"
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='assignment.override_approved'").fetchone()[0] == 0
+
+def test_legacy_terrain_classification_migrates_once_without_rewriting_later_admin_edits(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    legacy = sqlite3.connect(rotation_app.DB)
+    legacy.execute(
+        "CREATE TABLE terrains(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,kind TEXT DEFAULT 'basic',mandatory_year INTEGER DEFAULT 0,active INTEGER NOT NULL DEFAULT 1)"
+    )
+    legacy.executemany(
+        "INSERT INTO terrains(name,kind) VALUES(?,?)",
+        [("Sédation", "basic"), ("Maxillo-faciale", "basic"),
+         ("Chirurgie cardiaque", "basic"), ("Brûlés", "basic"),
+         ("CAC DBK", "basic"), ("Gynécologie", "optional")],
+    )
+    legacy.commit()
+    legacy.close()
+
+    assert client.get("/login").status_code == 200
+    with rotation_app.db() as conn:
+        for name in ("Sédation", "Maxillo-faciale", "Chirurgie cardiaque", "Brûlés", "CAC DBK"):
+            assert conn.execute("SELECT kind FROM terrains WHERE name=?", (name,)).fetchone()[0] == "optional"
+        assert conn.execute("SELECT kind FROM terrains WHERE name='Gynécologie'").fetchone()[0] == "basic"
+        assert conn.execute(
+            "SELECT value FROM settings WHERE key='terrain_classification_migration_20261017'"
+        ).fetchone()[0] == "1"
+        conn.execute("UPDATE terrains SET kind='mandatory' WHERE name='Sédation'")
+        conn.commit()
+
+    monkeypatch.setattr(rotation_app.app, "_ready", False, raising=False)
+    assert client.get("/login").status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT kind FROM terrains WHERE name='Sédation'").fetchone()[0] == "mandatory"
+
+def test_settings_rejects_password_shorter_than_twelve_characters(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        before = conn.execute(
+            "SELECT password_hash FROM users WHERE username='admin'"
+        ).fetchone()[0]
+        year = conn.execute("SELECT value FROM settings WHERE key='year'").fetchone()[0]
+
+    response = client.post(
+        "/settings",
+        data={"lang":"ar","year":year,"director":"","new_password":"weak"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "at least 12 characters".encode() in response.data
+    with rotation_app.db() as conn:
+        after = conn.execute(
+            "SELECT password_hash FROM users WHERE username='admin'"
+        ).fetchone()[0]
+        assert after == before
+
+def test_external_rotation_creation_rejects_overlap_with_existing_local_assignment(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,2)", ("LocalFirst", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='LocalFirst'").fetchone()[0]
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Réanimation chirurgicale'").fetchone()[0]
+        period = conn.execute("SELECT id,year_label,name FROM periods ORDER BY id LIMIT 1").fetchone()
+        conn.execute("INSERT INTO assignments(resident_id,terrain_id,period_id,status) VALUES(?,?,?,'confirmed')", (rid,tid,period["id"]))
+        conn.commit()
+    start_day, end_day = rotation_app.rotation_period_bounds(period["year_label"], period["name"])
+    response = client.post("/external-rotations", data={
+        "resident_id":str(rid),"supervisor":"Dr Test","destination":"Paris",
+        "hospital":"CHU Test","country":"France","rotation_type":"Observation",
+        "start_date":start_day.isoformat(),"end_date":end_day.isoformat(),"notes":"overlap"
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert b"overlaps an existing local assignment" in response.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM external_rotations WHERE resident_id=?", (rid,)).fetchone()[0] == 0
+
+
+def test_external_rotation_edit_rejects_overlap_with_existing_local_assignment(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,2)", ("LocalEdit", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='LocalEdit'").fetchone()[0]
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Réanimation chirurgicale'").fetchone()[0]
+        period = conn.execute("SELECT id,year_label,name FROM periods ORDER BY id LIMIT 1").fetchone()
+        conn.execute("INSERT INTO assignments(resident_id,terrain_id,period_id,status) VALUES(?,?,?,'confirmed')", (rid,tid,period["id"]))
+        conn.commit()
+    start_day, end_day = rotation_app.rotation_period_bounds(period["year_label"], period["name"])
+    nonoverlap_start = end_day + timedelta(days=1)
+    nonoverlap_end = nonoverlap_start + timedelta(days=7)
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO external_rotations(resident_id,supervisor,destination,hospital,country,rotation_type,start_date,end_date,status) VALUES(?,?,?,?,?,?,?,?,?)",
+            (rid,"Dr Test","Paris","CHU Test","France","Observation",nonoverlap_start.isoformat(),nonoverlap_end.isoformat(),"returned"),
+        )
+        xid = conn.execute("SELECT id FROM external_rotations WHERE resident_id=?", (rid,)).fetchone()[0]
+    response = client.post(f"/external-rotations/{xid}/edit", data={
+        "resident_id":str(rid),"supervisor":"Dr Test","destination":"Paris",
+        "hospital":"CHU Test","country":"France","rotation_type":"Observation",
+        "start_date":start_day.isoformat(),"end_date":end_day.isoformat(),"notes":"overlap"
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert b"overlaps an existing local assignment" in response.data
+    with rotation_app.db() as conn:
+        row = conn.execute("SELECT start_date,end_date FROM external_rotations WHERE id=?", (xid,)).fetchone()
+        assert tuple(row) == (nonoverlap_start.isoformat(), nonoverlap_end.isoformat())
+
+def test_resident_edit_persists_and_cannot_bypass_or_reverse_dems_graduation(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,2,'active')", ("Editable", "Resident"))
+        editable = conn.execute("SELECT id FROM residents WHERE surname='Editable'").fetchone()[0]
+        conn.execute("INSERT INTO residents(surname,firstname,year,status,dems_status) VALUES(?,?,4,'graduated','success')", ("Graduated", "Resident"))
+        graduated = conn.execute("SELECT id FROM residents WHERE surname='Graduated'").fetchone()[0]
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,4,'active')", ("Attempt", "Bypass"))
+        bypass = conn.execute("SELECT id FROM residents WHERE surname='Attempt'").fetchone()[0]
+
+    saved = client.post("/residents", data={
+        "action":"edit","rid":str(editable),"year":"2","repeat_year":"0","status":"inactive"
+    }, follow_redirects=True)
+    assert saved.status_code == 200
+    with rotation_app.db() as conn:
+        row = conn.execute("SELECT year,status FROM residents WHERE id=?", (editable,)).fetchone()
+        assert tuple(row) == (2,"inactive")
+
+    year_change = client.post("/residents", data={
+        "action":"edit","rid":str(editable),"year":"3","repeat_year":"0","status":"active"
+    }, follow_redirects=True)
+    assert year_change.status_code == 200
+    assert b"Study-year changes must use the official exam/promotion workflow" in year_change.data
+    with rotation_app.db() as conn:
+        row = conn.execute("SELECT year,status FROM residents WHERE id=?", (editable,)).fetchone()
+        assert tuple(row) == (2,"inactive")
+
+    bypass_response = client.post("/residents", data={
+        "action":"edit","rid":str(bypass),"year":"4","repeat_year":"0","status":"graduated"
+    }, follow_redirects=True)
+    assert bypass_response.status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT status FROM residents WHERE id=?", (bypass,)).fetchone()[0] == "active"
+
+    restore_response = client.post("/residents", data={
+        "action":"edit","rid":str(graduated),"year":"4","repeat_year":"0","status":"active"
+    }, follow_redirects=True)
+    assert restore_response.status_code == 200
+    assert b"Graduated residents are archived" in restore_response.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT status FROM residents WHERE id=?", (graduated,)).fetchone()[0] == "graduated"
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='resident.updated'").fetchone()[0] == 1
+
+def test_first_year_evaluation_does_not_record_decision_for_resident_in_later_year(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,2,'active')", ("LaterYear", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='LaterYear'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO exam_records(resident_id,study_year,module,theory,practical) VALUES(?,1,?,?,?)",
+            (rid,"Module A",12,12),
+        )
+        conn.commit()
+
+    response = client.post("/exams", data={
+        "action":"evaluate_first_year","resident":str(rid),"study_year":"1",
+        "all_modules_confirmed":"yes"
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert b"Only current first-year residents" in response.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT year FROM residents WHERE id=?", (rid,)).fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM decisions WHERE details LIKE ?", (f"%LaterYear Resident — first-year exams%",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='exam.first_year_evaluated'").fetchone()[0] == 0
+
+def test_startup_fills_missing_periods_in_partial_legacy_academic_year(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    legacy = sqlite3.connect(rotation_app.DB)
+    legacy.execute(
+        "CREATE TABLE periods(id INTEGER PRIMARY KEY,year_label TEXT NOT NULL,name TEXT NOT NULL,UNIQUE(year_label,name))"
+    )
+    legacy.execute("INSERT INTO periods(year_label,name) VALUES(?,?)", ("2026-2027","01 Fév - 30 Avr"))
+    legacy.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO settings(key,value) VALUES('year','2026-2027')")
+    legacy.commit()
+    legacy.close()
+
+    assert client.get("/login").status_code == 200
+    expected = {"01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"}
+    with rotation_app.db() as conn:
+        names = {row[0] for row in conn.execute("SELECT name FROM periods WHERE year_label='2026-2027'")}
+        assert names == expected
+        assert conn.execute("SELECT COUNT(*) FROM periods WHERE year_label='2026-2027'").fetchone()[0] == 4
+
+    monkeypatch.setattr(rotation_app.app, "_ready", False, raising=False)
+    assert client.get("/login").status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM periods WHERE year_label='2026-2027'").fetchone()[0] == 4
+
+def test_import_rejects_fractional_study_year_instead_of_truncating(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    source = b"surname,firstname,year,phone\nFractional,Resident,2.5,0550000000\n"
+    response = client.post(
+        "/import",
+        data={"file":(io.BytesIO(source),"fractional-year.csv")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert b"Year must be 1, 2, 3 or 4." in response.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM residents WHERE surname='Fractional'").fetchone()[0] == 0
+
+def test_deactivated_account_loses_existing_session_immediately(tmp_path, monkeypatch):
+    admin = setup_client(tmp_path, monkeypatch)
+    login(admin)
+    username = "revoked-session"
+    password = "strong-revoked-password-2026"
+    admin.post("/users", data={"username":username,"password":password,"role":"user"}, follow_redirects=True)
+
+    user_client = rotation_app.app.test_client()
+    signed_in = user_client.post(
+        "/login", data={"username":username,"password":password}, follow_redirects=True
+    )
+    assert signed_in.status_code == 200
+    assert user_client.get("/").status_code == 200
+
+    with rotation_app.db() as conn:
+        uid = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()[0]
+    admin.post("/users", data={"action":"deactivate","user_id":str(uid)}, follow_redirects=True)
+
+    revoked = user_client.get("/")
+    assert revoked.status_code == 302
+    assert "/login" in revoked.headers["Location"]
+    with user_client.session_transaction() as session:
+        assert "user" not in session
+
+def test_standard_user_cannot_create_rotation_assignments(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    client.post("/users", data={
+        "username":"assignment-operator",
+        "password":"assignment-operator-password-2026",
+        "role":"user",
+    }, follow_redirects=True)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,2)", ("NoAssign", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='NoAssign'").fetchone()[0]
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Réanimation chirurgicale'").fetchone()[0]
+        period = conn.execute("SELECT id,year_label FROM periods ORDER BY id LIMIT 1").fetchone()
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)",
+            (period["year_label"],tid,period["id"]),
+        )
+        conn.commit()
+    with client.session_transaction() as session:
+        session["user"]="assignment-operator"
+        session["role"]="user"
+        session["lang"]="en"
+
+    read_only = client.get("/assign")
+    assert read_only.status_code == 200
+    assert b"Only Super Admins can create assignments." in read_only.data
+    assert b'id="assignment-form"' not in read_only.data
+
+    response = client.post("/assign", data={
+        "resident":str(rid),"terrain":str(tid),"period":str(period["id"])
+    })
+    assert response.status_code == 403
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM assignments WHERE resident_id=?", (rid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='assignment.created'").fetchone()[0] == 0
+
+def test_history_rejects_invalid_year_period_and_duplicate_records(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,1)", ("History", "Resident"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='History'").fetchone()[0]
+        tid = conn.execute("SELECT id FROM terrains WHERE name='Réanimation chirurgicale'").fetchone()[0]
+        conn.commit()
+
+    invalid_year = client.post("/history", data={
+        "resident":str(rid),"terrain":str(tid),"year_label":"2025-2027",
+        "period":"01 Fév - 30 Avr","date_done":"2026-03-01"
+    }, follow_redirects=True)
+    assert invalid_year.status_code == 200
+    assert b"Academic year must be YYYY-YYYY" in invalid_year.data
+
+    invalid_period = client.post("/history", data={
+        "resident":str(rid),"terrain":str(tid),"year_label":"2025-2026",
+        "period":"invented period","date_done":"2026-03-01"
+    }, follow_redirects=True)
+    assert invalid_period.status_code == 200
+    assert b"Choose one of the four official rotation periods" in invalid_period.data
+
+    future_date = client.post("/history", data={
+        "resident":str(rid),"terrain":str(tid),"year_label":"2098-2099",
+        "period":"01 Fév - 30 Avr","date_done":"2098-03-01"
+    }, follow_redirects=True)
+    assert future_date.status_code == 200
+    assert b"A historical rotation date cannot be in the future" in future_date.data
+
+    payload = {
+        "resident":str(rid),"terrain":str(tid),"year_label":"2025-2026",
+        "period":"01 Fév - 30 Avr","date_done":"2026-03-01"
+    }
+    first = client.post("/history", data=payload, follow_redirects=True)
+    assert first.status_code == 200
+    second = client.post("/history", data=payload, follow_redirects=True)
+    assert second.status_code == 200
+    assert b"This historical rotation already exists" in second.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM history WHERE resident_id=? AND terrain_id=?", (rid,tid)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='history.created'").fetchone()[0] == 1
+
+def test_inactive_resident_cannot_receive_promotion_votes(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    client.post("/users", data={
+        "username":"benhocine",
+        "password":"official-admin-password-2026",
+        "role":"super_admin",
+    }, follow_redirects=True)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,2,'inactive')", ("Inactive", "Promotion"))
+        rid = conn.execute("SELECT id FROM residents WHERE surname='Inactive'").fetchone()[0]
+        conn.commit()
+
+    with client.session_transaction() as session:
+        session["user"]="benhocine"
+        session["role"]="super_admin"
+    first = client.post("/exams", data={
+        "action":"approve_advance","resident":str(rid),"study_year":"2",
+        "outcome":"approve","reason":"Should not count"
+    }, follow_redirects=True)
+    assert first.status_code == 200
+    assert b"Inactive residents cannot be advanced" in first.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM promotion_votes WHERE resident_id=?", (rid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='promotion.vote_recorded'").fetchone()[0] == 0
+
+def test_future_confirmed_rotations_do_not_count_as_completed_for_repeat_eligibility(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4) RETURNING id",
+            ("Future", "Rotations"),
+        ).fetchone()[0]
+        current_period = conn.execute("SELECT * FROM periods ORDER BY id LIMIT 1").fetchone()
+        target = conn.execute(
+            "SELECT id FROM terrains WHERE name='Réanimation chirurgicale'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,2)",
+            (current_period["year_label"],target,current_period["id"]),
+        )
+        conn.execute(
+            "INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",
+            (rid,target,"2025-2026","01 Fév - 30 Avr","2026-04-30"),
+        )
+        future_terrains = conn.execute(
+            "SELECT id FROM terrains WHERE active=1 AND kind IN ('mandatory','basic') AND id<>?",
+            (target,),
+        ).fetchall()
+        for index, terrain_row in enumerate(future_terrains):
+            start_year = 2099 + index
+            future_period_id = conn.execute(
+                "INSERT INTO periods(year_label,name) VALUES(?,?) RETURNING id",
+                (f"{start_year}-{start_year+1}","01 Fév - 30 Avr"),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO assignments(resident_id,terrain_id,period_id,status) VALUES(?,?,?,'confirmed')",
+                (rid,terrain_row["id"],future_period_id),
+            )
+        conn.commit()
+
+    with rotation_app.app.test_request_context("/"):
+        with rotation_app.db() as conn:
+            allowed, message, status = rotation_app.check(
+                conn,rid,target,current_period["id"],current_period["year_label"]
+            )
+    assert allowed is False
+    assert "التربص منجز سابقاً" in message
+
+def test_capacity_rejects_negative_and_cross_academic_year_periods(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        terrain_id = conn.execute(
+            "SELECT id FROM terrains WHERE active=1 ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        current = conn.execute("SELECT id,year_label FROM periods ORDER BY id LIMIT 1").fetchone()
+        other_period_id = conn.execute(
+            "INSERT INTO periods(year_label,name) VALUES(?,?) RETURNING id",
+            ("2099-2100","01 Fév - 30 Avr"),
+        ).fetchone()[0]
+        conn.commit()
+
+    negative = client.post("/capacities", data={
+        "terrain":str(terrain_id),"period":str(current["id"]),"places":"-1"
+    }, follow_redirects=True)
+    assert negative.status_code == 200
+    assert b"Invalid capacity input" in negative.data
+
+    wrong_year = client.post("/capacities", data={
+        "terrain":str(terrain_id),"period":str(other_period_id),"places":"3"
+    }, follow_redirects=True)
+    assert wrong_year.status_code == 200
+    assert b"Invalid capacity input" in wrong_year.data
+
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM capacities WHERE terrain_id=? AND period_id=?",
+            (terrain_id,other_period_id),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM capacities WHERE terrain_id=? AND period_id=? AND places<0",
+            (terrain_id,current["id"]),
+        ).fetchone()[0] == 0
+
+def test_import_confirmation_rechecks_duplicates_and_imports_nothing_on_stale_preview(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    source = (
+        b"surname,firstname,year,phone\n"
+        b"Fresh,Resident,2,0550000001\n"
+        b"Race,Condition,3,0550000002\n"
+    )
+    preview = client.post("/import", data={
+        "file": (io.BytesIO(source), "residents.csv")
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert preview.status_code == 200
+    match = re.search(rb'name="preview_id" value="(\d+)"', preview.data)
+    assert match
+
+    # Simulate another administrator adding a resident after the preview was made.
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,3)",
+            ("Race", "Condition"),
+        )
+        conn.commit()
+
+    confirmed = client.post("/import", data={
+        "action":"confirm", "preview_id":match.group(1).decode()
+    }, follow_redirects=True)
+    assert confirmed.status_code == 200
+    assert b"Nothing was imported" in confirmed.data
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM residents WHERE surname='Fresh' AND firstname='Resident'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM residents WHERE surname='Race' AND firstname='Condition' AND year=3"
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='residents.imported'").fetchone()[0] == 0
+
+def test_repeat_of_core_terrain_is_blocked_across_academic_years(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4) RETURNING id",
+            ("CrossYear", "Repeat"),
+        ).fetchone()[0]
+        target = conn.execute(
+            "SELECT id FROM terrains WHERE active=1 AND kind IN ('mandatory','basic') ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        current_year = conn.execute("SELECT value FROM settings WHERE key='year'").fetchone()[0]
+        current_period = conn.execute(
+            "SELECT id,year_label FROM periods WHERE year_label=? ORDER BY id LIMIT 1",
+            (current_year,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)",
+            (current_year,target,current_period["id"]),
+        )
+        previous_period = conn.execute(
+            "INSERT INTO periods(year_label,name) VALUES(?,?) RETURNING id",
+            ("2024-2025","01 Fév - 30 Avr"),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO assignments(resident_id,terrain_id,period_id,status) VALUES(?,?,?,'confirmed')",
+            (rid,target,previous_period),
+        )
+        conn.commit()
+
+    with rotation_app.app.test_request_context("/"):
+        with rotation_app.db() as conn:
+            allowed, message, status = rotation_app.check(
+                conn,rid,target,current_period["id"],current_year
+            )
+    assert allowed is False
+    assert status is None
+
+def test_future_dated_history_does_not_unlock_core_terrain_repeats(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4) RETURNING id",
+            ("FutureHistory", "Resident"),
+        ).fetchone()[0]
+        current_period = conn.execute("SELECT * FROM periods ORDER BY id LIMIT 1").fetchone()
+        terrains = conn.execute(
+            "SELECT id FROM terrains WHERE active=1 AND kind IN ('mandatory','basic')"
+        ).fetchall()
+        target = terrains[0]["id"]
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)",
+            (current_period["year_label"],target,current_period["id"]),
+        )
+        for terrain in terrains:
+            conn.execute(
+                "INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",
+                (rid,terrain["id"],"2098-2099","01 Fév - 30 Avr","2098-03-01"),
+            )
+        conn.commit()
+
+    with rotation_app.app.test_request_context("/"):
+        with rotation_app.db() as conn:
+            allowed, message, status = rotation_app.check(
+                conn,rid,target,current_period["id"],current_period["year_label"]
+            )
+    assert allowed is False
+    assert status is None
+
+def test_undated_future_history_does_not_unlock_core_terrain_repeats(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4) RETURNING id",
+            ("UndatedFuture", "History"),
+        ).fetchone()[0]
+        current_period = conn.execute("SELECT * FROM periods ORDER BY id LIMIT 1").fetchone()
+        terrains = conn.execute(
+            "SELECT id FROM terrains WHERE active=1 AND kind IN ('mandatory','basic')"
+        ).fetchall()
+        target = terrains[0]["id"]
+        conn.execute(
+            "INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,1)",
+            (current_period["year_label"], target, current_period["id"]),
+        )
+        for terrain in terrains:
+            conn.execute(
+                "INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?, '')",
+                (rid, terrain["id"], "2098-2099", "01 Fév - 30 Avr"),
+            )
+        conn.commit()
+
+    with rotation_app.app.test_request_context("/"):
+        with rotation_app.db() as conn:
+            allowed, message, status = rotation_app.check(
+                conn, rid, target, current_period["id"], current_period["year_label"]
+            )
+    assert allowed is False
+    assert status is None
+    assert "repetition" not in message.lower() or "completed" not in message.lower()
+
+
+def test_exam_recording_rejects_future_year_and_graduated_resident(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        future_id = conn.execute(
+            "INSERT INTO residents(surname,firstname,year,status) VALUES(?,?,2,'active') RETURNING id",
+            ("FutureYear", "Exam"),
+        ).fetchone()[0]
+        graduated_id = conn.execute(
+            "INSERT INTO residents(surname,firstname,year,status,dems_status) VALUES(?, ?,4,'graduated','success') RETURNING id",
+            ("Graduated", "Exam"),
+        ).fetchone()[0]
+        conn.commit()
+
+    future = client.post("/exams", data={
+        "action":"record","resident":str(future_id),"study_year":"3",
+        "module":"Future Module","theory":"15","practical":"15"
+    }, follow_redirects=True)
+    assert future.status_code == 200
+    assert b"Cannot record marks for a future study year" in future.data
+
+    graduated = client.post("/exams", data={
+        "action":"record","resident":str(graduated_id),"study_year":"4",
+        "module":"Late Module","theory":"15","practical":"15"
+    }, follow_redirects=True)
+    assert graduated.status_code == 200
+    assert b"Cannot record marks for a future study year" in graduated.data
+
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM exam_records WHERE resident_id IN (?,?)", (future_id,graduated_id)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action IN ('exam.recorded','exam.updated')").fetchone()[0] == 0
+
+def test_terrain_classification_cannot_change_after_rotation_records_exist(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        resident_id = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,2) RETURNING id",
+            ("Terrain", "Audit"),
+        ).fetchone()[0]
+        terrain = conn.execute(
+            "SELECT id,kind,mandatory_year,name FROM terrains WHERE active=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",
+            (resident_id,terrain["id"],"2025-2026","01 Fév - 30 Avr","2026-04-30"),
+        )
+        conn.commit()
+
+    response = client.post("/terrains", data={
+        "action":"edit","tid":str(terrain["id"]),"name":terrain["name"],
+        "kind":"optional" if terrain["kind"]!="optional" else "mandatory",
+        "mandatory_year":str(terrain["mandatory_year"]),
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert b"Terrain classification/year cannot be changed after rotation history or assignments exist" in response.data
+    with rotation_app.db() as conn:
+        unchanged = conn.execute("SELECT kind,mandatory_year FROM terrains WHERE id=?", (terrain["id"],)).fetchone()
+        assert unchanged["kind"] == terrain["kind"]
+        assert unchanged["mandatory_year"] == terrain["mandatory_year"]
+        assert conn.execute("SELECT COUNT(*) FROM history WHERE resident_id=? AND terrain_id=?", (resident_id,terrain["id"])).fetchone()[0] == 1
+
+def test_profile_rejects_invalid_identity_and_preserves_photo_when_omitted(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year,birth_place,birth_date,photo_path,phone) VALUES(?,?,?,?,?,?,?) RETURNING id",
+            ("Original","Resident",2,"Tizi Ouzou","1990-01-01","/photos/resident_1.png","0550000000"),
+        ).fetchone()[0]
+        conn.commit()
+    client.get(f"/profile/{rid}")
+
+    invalid = client.post(f"/profile/{rid}", data={
+        "surname":"   ","firstname":"Resident","birth_date":"2099-01-01"
+    }, follow_redirects=True)
+    assert invalid.status_code == 200
+    assert b"Surname and first name are required" in invalid.data
+    with rotation_app.db() as conn:
+        row = conn.execute("SELECT surname,photo_path FROM residents WHERE id=?",(rid,)).fetchone()
+        assert row["surname"] == "Original"
+        assert row["photo_path"] == "/photos/resident_1.png"
+
+    valid = client.post(f"/profile/{rid}", data={
+        "surname":"Updated","firstname":"Resident","birth_place":"Tizi Ouzou",
+        "birth_date":"1990-01-01","phone":"0550000000"
+    }, follow_redirects=True)
+    assert valid.status_code == 200
+    with rotation_app.db() as conn:
+        row = conn.execute("SELECT surname,photo_path FROM residents WHERE id=?",(rid,)).fetchone()
+        assert row["surname"] == "Updated"
+        assert row["photo_path"] == "/photos/resident_1.png"
+
+def test_resident_creation_validates_repeat_flag_lengths_and_duplicate_names(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    invalid_flag = client.post("/residents", data={
+        "surname":"Valid","firstname":"Flag","year":"1","repeat_year":"yes"
+    }, follow_redirects=True)
+    assert invalid_flag.status_code == 200
+    assert b"repeat flag must be 0 or 1" in invalid_flag.data
+
+    long_phone = client.post("/residents", data={
+        "surname":"Valid","firstname":"Phone","year":"1","phone":"x"*41
+    }, follow_redirects=True)
+    assert long_phone.status_code == 200
+    assert b"Phone must be at most 40 characters" in long_phone.data
+
+    payload = {"surname":"Test","firstname":"Resident","year":"2","phone":"0550000000","repeat_year":"0"}
+    first = client.post("/residents", data=payload, follow_redirects=True)
+    assert first.status_code == 200
+    second = client.post("/residents", data={**payload,"surname":" test "}, follow_redirects=True)
+    assert second.status_code == 200
+    assert b"A resident with the same name and study year already exists" in second.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM residents WHERE lower(surname)='test' AND lower(firstname)='resident' AND year=2").fetchone()[0] == 1
+
+def test_objectives_reject_invalid_year_inactive_terrain_and_duplicates(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        terrain = conn.execute("SELECT id FROM terrains WHERE active=1 ORDER BY id LIMIT 1").fetchone()[0]
+        conn.execute("INSERT INTO terrains(name,kind,active) VALUES('Inactive objective terrain','basic',0)")
+        inactive = conn.execute("SELECT id FROM terrains WHERE name='Inactive objective terrain'").fetchone()[0]
+        conn.commit()
+
+    invalid_year = client.post("/objectives", data={
+        "terrain":str(terrain),"study_year":"5","objective":"Objective"
+    }, follow_redirects=True)
+    assert invalid_year.status_code == 200
+    assert b"Objective study year must be 1, 2, 3 or 4" in invalid_year.data
+
+    inactive_terrain = client.post("/objectives", data={
+        "terrain":str(inactive),"study_year":"1","objective":"Objective"
+    }, follow_redirects=True)
+    assert inactive_terrain.status_code == 200
+    assert b"Choose an active terrain" in inactive_terrain.data
+
+    payload = {"terrain":str(terrain),"study_year":"1","objective":"Clinical skills"}
+    first = client.post("/objectives", data=payload, follow_redirects=True)
+    assert first.status_code == 200
+    second = client.post("/objectives", data=payload, follow_redirects=True)
+    assert second.status_code == 200
+    assert b"This objective already exists" in second.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM objectives WHERE terrain_id=? AND study_year=1 AND objective='Clinical skills'",(terrain,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM objectives WHERE terrain_id=? AND study_year=5",(terrain,)).fetchone()[0] == 0
+
+def test_documented_history_import_requires_preview_and_rejects_future_dates(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        conn.execute("INSERT INTO residents(surname,firstname,year) VALUES(?,?,3)", ("HistoryImport", "Resident"))
+        conn.commit()
+
+    valid_csv = (
+        "resident,terrain,year_label,period,date_done\n"
+        "HistoryImport Resident,Réanimation chirurgicale,2025-2026,01 Fév - 30 Avr,2026-04-30\n"
+    ).encode("utf-8")
+    preview = client.post(
+        "/import-history",
+        data={"file":(io.BytesIO(valid_csv),"history.csv")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert preview.status_code == 200
+    assert b"HistoryImport Resident" in preview.data
+    assert b"Confirm import" in preview.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM history").fetchone()[0] == 0
+    match = re.search(rb'name="preview_id" value="(\d+)"', preview.data)
+    assert match
+    confirmed = client.post("/import-history", data={
+        "action":"confirm","preview_id":match.group(1).decode()
+    }, follow_redirects=True)
+    assert confirmed.status_code == 200
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM history h JOIN residents r ON r.id=h.resident_id WHERE r.surname='HistoryImport'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM audit WHERE action='history.imported'").fetchone()[0] == 1
+
+    future_csv = (
+        "resident,terrain,year_label,period,date_done\n"
+        "HistoryImport Resident,Réanimation polyvalente,2026-2027,01 Fév - 30 Avr,2099-03-01\n"
+    ).encode("utf-8")
+    future_preview = client.post(
+        "/import-history",
+        data={"file":(io.BytesIO(future_csv),"future-history.csv")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert future_preview.status_code == 200
+    assert b"A historical rotation date cannot be in the future" in future_preview.data
+    assert b"disabled" in future_preview.data
+    with rotation_app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM history h JOIN residents r ON r.id=h.resident_id WHERE r.surname='HistoryImport'").fetchone()[0] == 1
+
+def test_exam_route_rejects_malformed_ids_and_scores_without_server_error(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    with rotation_app.db() as conn:
+        rid = conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,1) RETURNING id",
+            ("Malformed", "ExamInput"),
+        ).fetchone()[0]
+        conn.commit()
+
+    bad_year = client.post("/exams", data={
+        "action":"record","resident":str(rid),"study_year":"not-a-year",
+        "module":"Module A","theory":"12","practical":"13",
+    }, follow_redirects=True)
+    assert bad_year.status_code == 200
+    assert b"Choose a valid resident and study year" in bad_year.data
+
+    bad_score = client.post("/exams", data={
+        "action":"record","resident":str(rid),"study_year":"1",
+        "module":"Module A","theory":"not-a-number","practical":"13",
+    }, follow_redirects=True)
+    assert bad_score.status_code == 200
+    assert b"numeric marks from 0 to 20 are required" in bad_score.data
+
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM exam_records WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action IN ('exam.recorded','exam.updated')"
+        ).fetchone()[0] == 0
+
+
+
+def test_dems_rejects_future_exam_date_without_vote_or_audit(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+    for username in ("benhocine", "drdris"):
+        client.post("/users", data={
+            "username": username,
+            "password": "strong-test-password-2026",
+            "role": "super_admin",
+        }, follow_redirects=True)
+    with rotation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO residents(surname,firstname,year) VALUES(?,?,4)",
+            ("FutureDEMS", "Resident"),
+        )
+        rid = conn.execute(
+            "SELECT id FROM residents WHERE surname='FutureDEMS'"
+        ).fetchone()[0]
+        conn.commit()
+
+    future_date = (rotation_app.date.today() + timedelta(days=1)).isoformat()
+    with client.session_transaction() as sess:
+        sess["user"] = "benhocine"
+        sess["role"] = "super_admin"
+    response = client.post("/dems", data={
+        "resident": str(rid),
+        "success_date": future_date,
+        "outcome": "approve",
+        "reason": "Should not be accepted",
+    }, follow_redirects=True)
+
+    assert response.status_code == 200
+    assert b"DEMS exam date cannot be in the future" in response.data
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dems_votes WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dems_archive WHERE resident_id=?", (rid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action='dems.vote_recorded'"
+        ).fetchone()[0] == 0
+
+
+def test_admin_routes_handle_malformed_record_ids_without_server_error(tmp_path, monkeypatch):
+    client = setup_client(tmp_path, monkeypatch)
+    login(client)
+
+    decision_response = client.post("/decisions", data={
+        "aid": "not-an-id",
+        "outcome": "reject",
+        "reason": "Malformed request",
+    }, follow_redirects=True)
+    assert decision_response.status_code == 200
+
+    user_response = client.post("/users", data={
+        "action": "deactivate",
+        "user_id": "not-a-user-id",
+    }, follow_redirects=True)
+    assert user_response.status_code == 200
+
+    with rotation_app.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE reason='Malformed request'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit WHERE action IN ('assignment.override_approved','assignment.override_rejected','user.deactivated','user.activated')"
+        ).fetchone()[0] == 0

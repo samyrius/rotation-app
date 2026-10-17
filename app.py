@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, request, redirect, session, render_template_string, flash, send_file, send_from_directory
 import sqlite3, os, hashlib, hmac, io, csv, shutil, json, tempfile, re, subprocess, secrets, smtplib, time, zipfile
+import warnings
+from PIL import Image, ImageOps
 from datetime import datetime, date
 from werkzeug.utils import secure_filename
 
@@ -86,6 +88,7 @@ def init():
  # Migrate user email fields only after the users table exists (fresh DB and legacy DB).
  ensure_column(c,"users","email","TEXT DEFAULT ''")
  ensure_column(c,"users","email_verified","INTEGER NOT NULL DEFAULT 0")
+ ensure_column(c,"import_previews","import_type","TEXT NOT NULL DEFAULT 'residents'")
  y=str(datetime.now().year)+"-"+str(datetime.now().year+1)
  c.execute("INSERT OR IGNORE INTO settings VALUES('year',?)",(y,))
  initial_password=os.environ.get("ROTATION_INITIAL_PASSWORD")
@@ -94,10 +97,17 @@ def init():
  c.execute("INSERT OR IGNORE INTO settings VALUES('director',?)",("Professor Benhocine",))
  for n,k in [("Réanimation chirurgicale","basic"),("Réanimation polyvalente","basic"),("Chirurgie générale","mandatory"),("Urologie","basic"),("Orthopédie","basic"),("Neurochirurgie","basic"),("Sédation","optional"),("Maxillo-faciale","optional"),("CCI","basic"),("Obstétrique","basic"),("Chirurgie cardiaque","optional"),("PU Médecine","basic"),("PU Chirurgie","basic"),("ORL","basic"),("Ophtalmologie","basic"),("Gynécologie","basic"),("Chirurgie thoracique","basic"),("Brûlés","optional"),("CAC DBK","optional")]:
   c.execute("INSERT OR IGNORE INTO terrains(name,kind) VALUES(?,?)",(n,k))
+ # One-time correction for databases created before the agreed terrain classification.
+ # Do not reapply on every startup, so later authorized admin edits remain intact.
+ if not setting(c,"terrain_classification_migration_20261017"):
+  for name in ("Sédation","Maxillo-faciale","Chirurgie cardiaque","Brûlés","CAC DBK"):
+   c.execute("UPDATE terrains SET kind='optional' WHERE name=?",(name,))
+  c.execute("UPDATE terrains SET kind='basic' WHERE name='Gynécologie'")
+  c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("terrain_classification_migration_20261017","1"))
  y=setting(c,"year",y)
- if not c.execute("SELECT 1 FROM periods WHERE year_label=?",(y,)).fetchone():
-  for n in ["01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"]:
-   c.execute("INSERT OR IGNORE INTO periods(year_label,name) VALUES(?,?)",(y,n))
+ # Fill any missing canonical periods in legacy/partially initialized databases.
+ for n in ["01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"]:
+  c.execute("INSERT OR IGNORE INTO periods(year_label,name) VALUES(?,?)",(y,n))
  c.commit(); c.close()
 @app.before_request
 def boot():
@@ -115,7 +125,7 @@ def page(body,**kw):
  lang=session.get("lang","ar")
  csrf_token=session.setdefault("_csrf_token",secrets.token_urlsafe(32))
  body=re.sub(r'(<form\b(?=[^>]*\bmethod\s*=\s*["\']post["\'])[^>]*>)',lambda match:match.group(1)+'<input type="hidden" name="_csrf_token" value="{{ csrf_token }}">',body,flags=re.IGNORECASE)
- shell="""<!doctype html><html lang="{{lang}}" dir="{{'rtl' if lang=='ar' else 'ltr'}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#103c66"><meta name="application-name" content="ResiManage"><link rel="icon" type="image/svg+xml" href="/static/resitrack-icon.svg"><title>{{t('app')}} — {{t('year')}}</title></head><style>*{box-sizing:border-box}html{width:100%;max-width:100%;overflow-x:hidden}body{font-family:Arial,sans-serif;background:#f1f5f9;margin:0;color:#182b3d;width:100%;max-width:100%;overflow-x:hidden;line-height:1.5}header{background:linear-gradient(135deg,#103c66 0%,#17689a 58%,#23a6a5 100%);color:white;padding:clamp(10px,3vw,18px);overflow-wrap:anywhere}.brand-lockup{display:flex;align-items:center;gap:14px;max-width:1050px;margin:0 auto}.brand-icon{width:clamp(48px,12vw,70px);height:auto;flex:0 0 auto;filter:drop-shadow(0 5px 5px #001b3380)}.brand-lockup h2{margin:0;font-size:clamp(21px,4vw,30px);letter-spacing:.2px}.brand-tagline{margin:2px 0 5px;opacity:.93;font-size:clamp(12px,2.5vw,15px)}.brand-year{font-size:12px;opacity:.9}main{width:100%;max-width:1050px;margin:0 auto;padding:clamp(7px,2.5vw,16px);min-width:0}nav{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px;overflow:visible;max-width:100%;background:white;padding:10px}.nav-group{position:relative;min-width:0}.nav-group summary{list-style:none;background:#164e83;color:white;padding:9px 12px;border-radius:7px;cursor:pointer;white-space:nowrap}.nav-group summary::-webkit-details-marker{display:none}.nav-group summary:after{content:" ▾";font-size:.85em}.nav-menu{display:flex;flex-direction:column;gap:5px;min-width:180px;padding:7px;margin-top:5px;background:#fff;border:1px solid #d7e1eb;border-radius:9px;box-shadow:0 6px 18px #182b3d22}.nav-menu a{display:block;width:100%}.main-nav>a{flex:0 0 auto}.nav-group[open]{z-index:10}.nav-group[open] .nav-menu{position:absolute;top:100%;inset-inline-start:0;max-width:min(85vw,280px);max-height:65vh;overflow:auto}.nav-group[open] .nav-menu a{white-space:normal}a,button{background:#164e83;color:white;padding:9px 12px;border:0;border-radius:7px;text-decoration:none;display:inline-block;white-space:normal;overflow-wrap:anywhere;max-width:100%;cursor:pointer}section{background:white;padding:clamp(9px,2.5vw,15px);border:1px solid #d7e1eb;border-radius:10px;margin:10px 0;min-width:0;max-width:100%;overflow-wrap:anywhere}input,select,textarea{font:inherit;padding:9px;border:1px solid #bccada;border-radius:7px;width:100%;max-width:100%;margin:4px 0 9px}label{display:block;min-width:0}table{border-collapse:collapse;width:100%;min-width:540px}td,th{text-align:start;border-bottom:1px solid #ddd;padding:8px;overflow-wrap:anywhere}.wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));gap:8px;min-width:0}.msg{background:#fff0c2;padding:10px;border-radius:7px;overflow-wrap:anywhere}.good{color:green}.bad{color:#b21d1d}.muted{color:#526274}img,video,iframe{max-width:100%;height:auto}@media(max-width:600px){main{padding:7px}header{font-size:clamp(13px,3.5vw,16px)}nav{padding:7px;gap:5px}.nav-group summary,nav>a{font-size:13px;padding:8px 9px}.nav-menu{min-width:min(220px,82vw)}section{margin:7px 0;padding:10px}.grid{grid-template-columns:minmax(0,1fr)}table{min-width:540px}} [dir=rtl]{text-align:right}[dir=rtl] nav{direction:rtl}
+ shell="""<!doctype html><html lang="{{lang}}" dir="{{'rtl' if lang=='ar' else 'ltr'}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#103c66"><meta name="application-name" content="ResiManage"><link rel="icon" type="image/svg+xml" href="/static/resimanage-3d-icon.jpg"><title>{{t('app')}} — {{t('year')}}</title></head><style>*{box-sizing:border-box}html{width:100%;max-width:100%;overflow-x:hidden}body{font-family:Arial,sans-serif;background:#f1f5f9;margin:0;color:#182b3d;width:100%;max-width:100%;overflow-x:hidden;line-height:1.5}header{background:linear-gradient(135deg,#103c66 0%,#17689a 58%,#23a6a5 100%);color:white;padding:clamp(10px,3vw,18px);overflow-wrap:anywhere}.brand-lockup{display:flex;align-items:center;gap:14px;max-width:1050px;margin:0 auto}.brand-icon{width:clamp(48px,12vw,70px);height:auto;flex:0 0 auto;filter:drop-shadow(0 5px 5px #001b3380)}.brand-lockup h2{margin:0;font-size:clamp(21px,4vw,30px);letter-spacing:.2px}.brand-tagline{margin:2px 0 5px;opacity:.93;font-size:clamp(12px,2.5vw,15px)}.brand-year{font-size:12px;opacity:.9}main{width:100%;max-width:1050px;margin:0 auto;padding:clamp(7px,2.5vw,16px);min-width:0}nav{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px;overflow:visible;max-width:100%;background:white;padding:10px}.nav-group{position:relative;min-width:0}.nav-group summary{list-style:none;background:#164e83;color:white;padding:9px 12px;border-radius:7px;cursor:pointer;white-space:nowrap}.nav-group summary::-webkit-details-marker{display:none}.nav-group summary:after{content:" ▾";font-size:.85em}.nav-menu{display:flex;flex-direction:column;gap:5px;min-width:180px;padding:7px;margin-top:5px;background:#fff;border:1px solid #d7e1eb;border-radius:9px;box-shadow:0 6px 18px #182b3d22}.nav-menu a{display:block;width:100%}.main-nav>a{flex:0 0 auto}.nav-group[open]{z-index:10}.nav-group[open] .nav-menu{position:absolute;top:100%;inset-inline-start:0;max-width:min(85vw,280px);max-height:65vh;overflow:auto}.nav-group[open] .nav-menu a{white-space:normal}a,button{background:#164e83;color:white;padding:9px 12px;border:0;border-radius:7px;text-decoration:none;display:inline-block;white-space:normal;overflow-wrap:anywhere;max-width:100%;cursor:pointer}section{background:white;padding:clamp(9px,2.5vw,15px);border:1px solid #d7e1eb;border-radius:10px;margin:10px 0;min-width:0;max-width:100%;overflow-wrap:anywhere}input,select,textarea{font:inherit;padding:9px;border:1px solid #bccada;border-radius:7px;width:100%;max-width:100%;margin:4px 0 9px}label{display:block;min-width:0}table{border-collapse:collapse;width:100%;min-width:540px}td,th{text-align:start;border-bottom:1px solid #ddd;padding:8px;overflow-wrap:anywhere}.wrap{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));gap:8px;min-width:0}.msg{background:#fff0c2;padding:10px;border-radius:7px;overflow-wrap:anywhere}.good{color:green}.bad{color:#b21d1d}.muted{color:#526274}img,video,iframe{max-width:100%;height:auto}@media(max-width:600px){main{padding:7px}header{font-size:clamp(13px,3.5vw,16px)}nav{padding:7px;gap:5px}.nav-group summary,nav>a{font-size:13px;padding:8px 9px}.nav-menu{min-width:min(220px,82vw)}section{margin:7px 0;padding:10px}.grid{grid-template-columns:minmax(0,1fr)}table{min-width:540px}} [dir=rtl]{text-align:right}[dir=rtl] nav{direction:rtl}
 /* ResiManage unified interior visual identity */
 :root{--rt-navy:#142b49;--rt-blue:#2768a8;--rt-mint:#36cfae;--rt-cyan:#45c7e8;--rt-coral:#ff8b72;--rt-amber:#ffc36c;--rt-violet:#9b8cf5;--rt-ink:#21334b;--rt-line:#dce6f0;--rt-glass:#ffffffd9}
 body{background:radial-gradient(ellipse at 8% 0%,#ffd2ad55,transparent 28%),radial-gradient(ellipse at 95% 22%,#7ce8d533,transparent 26%),linear-gradient(145deg,#f3f7fc,#edf3fa 58%,#f8f1f8);color:var(--rt-ink)}
@@ -174,16 +184,58 @@ th{background:#0b3552!important;color:#70eaf2!important}td{background:#061d32;bo
 .rt-progress{background:#123750!important}.rt-progress span{background:linear-gradient(90deg,#16d8bc,#16c8ed)!important}
 .login-emblem{color:#20e2e7!important;text-shadow:0 0 25px #16d8ed!important}
 @media(max-width:600px){main{padding:8px}.main-nav{position:relative;top:auto;justify-content:flex-start}.rt-stats,.rt-quick-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style><header class="brand-header"><div class="brand-lockup"><img class="brand-icon" src="/static/resitrack-icon.svg" width="64" height="64" alt="ResiManage"><div><h2>{{t('app')}}</h2><p class="brand-tagline">{% if lang=='ar' %}تسيير تربصات الأطباء المقيمين{% elif lang=='fr' %}Gestion des stages des médecins résidents{% else %}Resident rotation management{% endif %}</p><span class="brand-year">{{t('year')}}: {{year}}</span></div></div></header>{% if user %}<nav class="main-nav"><a href="/"><span class="nav-icon">⌂</span>{{t('home')}}</a><details class="nav-group"><summary><span class="nav-icon">♙</span>{{t('residents')}}</summary><div class="nav-menu"><a href="/residents">{{t('manage_residents')}}</a><a href="/objectives">{{t('objectives')}}</a><a href="/import">{{t('import_residents')}}</a><a href="/exams">{{t('promotion')}}</a><a href="/dems">{{t('dems_success')}}</a></div></details><a href="/terrains"><span class="nav-icon">▥</span>{{t('terrains')}}</a><a href="/capacities"><span class="nav-icon">▦</span>{{t('capacities')}}</a><a href="/assign"><span class="nav-icon">⇄</span>{{t('assign')}}</a><a href="/history"><span class="nav-icon">◷</span>{{t('history')}}</a><a href="/decisions"><span class="nav-icon">✓</span>{{t('decisions')}}</a><a href="/summary"><span class="nav-icon">▤</span>{{t('summary')}}</a><details class="nav-group"><summary><span class="nav-icon">⚙</span>{{t('settings')}}</summary><div class="nav-menu"><a href="/settings">{{t('settings_page')}}</a><a href="/users">{{t('users')}}</a><a href="/audit">{{t('audit')}}</a><a href="/backup">{{t('backup')}}</a><a href="/export">{{t('export')}}</a><a href="/restore">{{t('restore')}}</a><a href="/logout">{{t('logout')}}</a></div></details><div class="rt-language" aria-label="Language"><a href="/lang/ar" {% if lang=='ar' %}aria-current="page"{% endif %} title="العربية">ع</a><a href="/lang/fr" {% if lang=='fr' %}aria-current="page"{% endif %} title="Français">FR</a><a href="/lang/en" {% if lang=='en' %}aria-current="page"{% endif %} title="English">EN</a></div></nav>{% endif %}<main>{% for m in get_flashed_messages() %}<p class="msg">{{m}}</p>{% endfor %}{{body|safe}}</main><footer class="rt-footer">© <strong>Tous droits réservés · ResiManage · Dr Dris</strong><span class="rt-sep"> | </span><strong>All rights reserved · ResiManage · Dr Dris</strong><span class="rt-sep"> | </span><strong>جميع الحقوق محفوظة · ResiManage · Dr Dris</strong></footer></html>"""
+
+/* Functional navigation redesign: task-based sidebar, clear active states, responsive mobile groups */
+.rt-app-shell{display:grid;grid-template-columns:260px minmax(0,1fr);align-items:start;gap:18px;width:100%;max-width:1500px;margin:0 auto;padding:16px;direction:inherit}
+.rt-app-shell>main{width:100%;max-width:none;min-width:0;margin:0;padding:0}
+.main-nav{position:sticky;top:12px;z-index:30;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:7px;width:100%;min-width:0;padding:12px;background:#071a2beF!important;border:1px solid #15506b!important;border-radius:18px!important;box-shadow:0 12px 30px #00101f30!important;backdrop-filter:blur(18px)}
+.main-nav>a,.nav-group summary{display:flex;align-items:center;gap:9px;width:100%;min-height:44px;padding:10px 12px!important;border:1px solid #174c68!important;border-radius:11px!important;background:#0a2b47!important;color:#dff8ff!important;box-shadow:none!important;text-align:start;font-size:14px;font-weight:600;transition:background .16s ease,border-color .16s ease,transform .16s ease}
+.nav-group{width:100%;min-width:0}
+.nav-group summary{list-style:none;cursor:pointer;justify-content:space-between}
+.nav-group summary::-webkit-details-marker{display:none}
+.nav-group summary:after{content:'⌄';font-size:14px;color:#74e7e8;transition:transform .16s ease}
+.nav-group[open] summary:after{transform:rotate(180deg)}
+.nav-group summary .nav-icon,.main-nav .nav-icon{display:inline-flex;align-items:center;justify-content:center;flex:0 0 24px;min-width:24px;height:24px;margin:0;color:#71e5e4;font-size:17px}
+.nav-menu{position:static!important;display:flex;flex-direction:column;gap:4px;min-width:0;width:100%;max-width:none!important;max-height:none!important;overflow:visible!important;margin:5px 0 3px;padding:5px 7px;background:#041728!important;border:1px solid #123e57!important;border-radius:12px!important;box-shadow:none!important}
+.nav-menu a{display:flex;align-items:center;width:100%;min-height:38px;padding:8px 10px!important;background:transparent!important;color:#b8d5e4!important;border:1px solid transparent!important;border-inline-start:3px solid transparent!important;border-radius:8px!important;box-shadow:none!important;font-size:13px;font-weight:500}
+.main-nav a:hover,.nav-group summary:hover,.nav-menu a:hover{background:#0e3a56!important;color:#fff!important;border-color:#1a6a83!important;transform:none!important;box-shadow:none!important}
+.main-nav a.is-active,.nav-menu a.is-active{background:linear-gradient(100deg,#0a6b7a,#0d536b)!important;color:#fff!important;border-color:#22c9c7!important;border-inline-start-color:#39e0c1!important;font-weight:700}
+.rt-language{display:flex;align-items:center;justify-content:center;gap:6px;margin:8px 0 0;padding-top:12px;border-top:1px solid #17435b}
+.rt-language a{min-width:40px;text-align:center}
+.rt-language a[aria-current=page]{background:#19b9b5!important;color:#031b2c!important;border-color:#51e4d9!important}
+.rt-app-shell section{margin:0 0 14px}
+.rt-app-shell .rt-quick-actions{margin-top:16px}
+:focus-visible{outline:3px solid #39dfcf!important;outline-offset:2px}
+ .rt-app-shell:not(:has(.main-nav)){display:block;max-width:1120px} @media(max-width:900px){.rt-app-shell{grid-template-columns:220px minmax(0,1fr);gap:12px;padding:10px}.main-nav{padding:9px}}
+@media(max-width:680px){.rt-app-shell{display:flex;flex-direction:column;gap:12px;padding:8px}.main-nav{position:relative;top:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:7px;padding:9px;border-radius:14px!important}.main-nav>.nav-home{grid-column:1/-1}.main-nav>.nav-group{align-self:start}.nav-group summary{min-height:44px;font-size:12px!important;padding:8px!important}.nav-group[open] .nav-menu{position:static!important;grid-column:1/-1;max-height:42vh!important;overflow:auto!important}.nav-menu a{font-size:12px}.rt-language{grid-column:1/-1;margin-top:2px;padding-top:8px}.rt-app-shell>main{padding:0}.rt-app-shell section{margin-bottom:10px}}
+@media(prefers-reduced-motion:reduce){.main-nav *{transition:none!important}}
+.rt-profile-panel{padding:clamp(16px,3vw,28px);background:linear-gradient(145deg,#ffffffef,#f1f8fcf2);border:1px solid #fff;box-shadow:0 16px 38px #17365b14}.rt-profile-head{display:flex;align-items:center;gap:20px;padding:4px 0 22px;border-bottom:1px solid #dce7f0;margin-bottom:20px}.rt-profile-avatar[hidden]{display:none!important}.rt-profile-avatar{display:block;width:clamp(88px,18vw,132px);height:clamp(88px,18vw,132px);object-fit:cover;border-radius:28px;border:4px solid white;box-shadow:0 10px 24px #17365b24;background:#e8f2f7}.rt-avatar-placeholder{display:grid;place-items:center;font-size:48px}.rt-profile-heading{min-width:0}.rt-profile-heading h2{margin:4px 0 8px;font-size:clamp(22px,4vw,32px);overflow-wrap:anywhere}.rt-eyebrow{font-size:11px;letter-spacing:1.3px;font-weight:800;color:#168c91}.rt-chip{display:inline-flex;align-items:center;padding:4px 10px;margin-inline-end:6px;border-radius:999px;background:#e5efff;color:#285b8c;font-size:12px;font-weight:700}.rt-chip-active{background:#dcf8eb;color:#167b58}.rt-chip-muted{background:#eef1f5;color:#596a7c}.rt-profile-form{display:grid;gap:16px}.rt-field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 16px}.rt-field-grid label{font-weight:700;color:#34536d}.rt-field-grid input{margin-top:7px;background:#fff}.rt-photo-picker{padding:15px;border:1px dashed #8cb7ca;border-radius:15px;background:linear-gradient(135deg,#f0fbfc,#f7f6ff)}.rt-photo-picker label{font-weight:800;color:#285c79}.rt-photo-picker input[type=file]{background:#fff;border:1px solid #d6e4ee;padding:10px}.rt-photo-picker small{display:block;color:#61778a}.rt-savebar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.rt-savebar button{min-width:190px;font-weight:800;padding:12px 18px}.rt-secondary-action{background:#edf4f9;color:#31536f;box-shadow:none;border:1px solid #dce7f0}.rt-profile-links{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}.rt-profile-links a{background:transparent;color:#28668e;box-shadow:none;padding:4px 0}.rt-profile-form input:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid #39bda9;outline-offset:3px}@media(max-width:620px){.rt-profile-head{align-items:flex-start;gap:12px}.rt-profile-avatar{border-radius:20px}.rt-field-grid{grid-template-columns:minmax(0,1fr)}.rt-savebar{align-items:stretch;flex-direction:column}.rt-savebar button,.rt-savebar a{width:100%;text-align:center}.rt-profile-panel{padding:14px}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}</style><header class="brand-header"><div class="brand-lockup"><img class="brand-icon" src="/static/resimanage-3d-icon.jpg" width="64" height="64" alt="ResiManage"><div><h2>{{t('app')}}</h2><p class="brand-tagline">{% if lang=='ar' %}تسيير تربصات الأطباء المقيمين{% elif lang=='fr' %}Gestion des stages des médecins résidents{% else %}Resident rotation management{% endif %}</p><span class="brand-year">{{t('year')}}: {{year}}</span></div></div></header><div class="rt-app-shell">{% if user %}<nav class="main-nav" aria-label="{% if lang=='ar' %}التنقل الرئيسي{% elif lang=='fr' %}Navigation principale{% else %}Main navigation{% endif %}">
+<a class="nav-home {% if request.path=='/' %}is-active{% endif %}" href="/"><span class="nav-icon">⌂</span><span>{{t('home')}}</span></a>
+<details class="nav-group" {% if request.path in ['/residents','/objectives','/import','/exams','/dems'] %}open{% endif %}><summary><span class="nav-icon">♙</span><span>{{t('residents')}}</span></summary><div class="nav-menu"><a href="/residents" class="{% if request.path=='/residents' %}is-active{% endif %}">{{t('manage_residents')}}</a><a href="/objectives" class="{% if request.path=='/objectives' %}is-active{% endif %}">{{t('objectives')}}</a><a href="/import" class="{% if request.path=='/import' %}is-active{% endif %}">{{t('import_residents')}}</a><a href="/exams" class="{% if request.path=='/exams' %}is-active{% endif %}">{{t('promotion')}}</a><a href="/dems" class="{% if request.path=='/dems' %}is-active{% endif %}">{{t('dems_success')}}</a></div></details>
+<details class="nav-group" {% if request.path in ['/terrains','/capacities','/assign','/history','/leave','/external-rotations'] %}open{% endif %}><summary><span class="nav-icon">⇄</span><span>{% if lang=='ar' %}التربصات والتخطيط{% elif lang=='fr' %}Stages et planification{% else %}Rotations & planning{% endif %}</span></summary><div class="nav-menu"><a href="/terrains" class="{% if request.path=='/terrains' %}is-active{% endif %}">{{t('terrains')}}</a><a href="/capacities" class="{% if request.path=='/capacities' %}is-active{% endif %}">{{t('capacities')}}</a><a href="/assign" class="{% if request.path=='/assign' %}is-active{% endif %}">{{t('assign')}}</a><a href="/history" class="{% if request.path=='/history' %}is-active{% endif %}">{{t('history')}}</a><a href="/leave" class="{% if request.path=='/leave' %}is-active{% endif %}">{% if lang=='ar' %}الإجازات{% elif lang=='fr' %}Congés{% else %}Annual leave{% endif %}</a><a href="/external-rotations" class="{% if request.path.startswith('/external-rotations') %}is-active{% endif %}">{% if lang=='ar' %}التربصات الخارجية{% elif lang=='fr' %}Stages externes{% else %}External rotations{% endif %}</a></div></details>
+<details class="nav-group" {% if request.path in ['/decisions','/summary'] %}open{% endif %}><summary><span class="nav-icon">▤</span><span>{% if lang=='ar' %}المتابعة والتقارير{% elif lang=='fr' %}Suivi et rapports{% else %}Monitoring & reports{% endif %}</span></summary><div class="nav-menu"><a href="/decisions" class="{% if request.path=='/decisions' %}is-active{% endif %}">{{t('decisions')}}</a><a href="/summary" class="{% if request.path=='/summary' %}is-active{% endif %}">{{t('summary')}}</a></div></details>
+<details class="nav-group" {% if request.path in ['/settings','/users','/audit','/backup','/export','/restore'] %}open{% endif %}><summary><span class="nav-icon">⚙</span><span>{{t('settings')}}</span></summary><div class="nav-menu"><a href="/settings" class="{% if request.path=='/settings' %}is-active{% endif %}">{{t('settings_page')}}</a><a href="/users" class="{% if request.path=='/users' %}is-active{% endif %}">{{t('users')}}</a><a href="/audit" class="{% if request.path=='/audit' %}is-active{% endif %}">{{t('audit')}}</a><a href="/backup" class="{% if request.path=='/backup' %}is-active{% endif %}">{{t('backup')}}</a><a href="/export" class="{% if request.path=='/export' %}is-active{% endif %}">{{t('export')}}</a><a href="/restore" class="{% if request.path=='/restore' %}is-active{% endif %}">{{t('restore')}}</a><a href="/logout">{{t('logout')}}</a></div></details>
+<div class="rt-language" aria-label="Language"><a href="/lang/ar" {% if lang=='ar' %}aria-current="page"{% endif %} title="العربية">ع</a><a href="/lang/fr" {% if lang=='fr' %}aria-current="page"{% endif %} title="Français">FR</a><a href="/lang/en" {% if lang=='en' %}aria-current="page"{% endif %} title="English">EN</a></div></nav>{% endif %}<main>{% for m in get_flashed_messages() %}<p class="msg">{{m}}</p>{% endfor %}{{body|safe}}</main></div><footer class="rt-footer">© <strong>Tous droits réservés · ResiManage · Dr Dris</strong><span class="rt-sep"> | </span><strong>All rights reserved · ResiManage · Dr Dris</strong><span class="rt-sep"> | </span><strong>جميع الحقوق محفوظة · ResiManage · Dr Dris</strong></footer></html>"""
  context={"t":tr,"lang":lang,"year":setting(db(),"year")}
  context.update(kw)
+ context.setdefault("role",session.get("role",""))
  context.setdefault("csrf_token",csrf_token)
  inner=render_template_string(body,**context)
  return render_template_string(shell,body=inner,lang=lang,t=tr,year=setting(db(),"year"),user=bool(session.get("user")),role=session.get("role",""))
 def guard():
- if not session.get("user"): return redirect("/login")
+ username=session.get("user")
+ if not username: return redirect("/login")
+ c=db()
+ account=c.execute("SELECT role,active FROM users WHERE username=?",(username,)).fetchone()
+ c.close()
+ if not account or not account["active"]:
+  session.clear()
+  return redirect("/login")
+ # Reflect the current role from the database instead of trusting stale session data.
+ session["role"]=account["role"]
 def super_guard():
- if not session.get("user"): return redirect("/login")
+ denied=guard()
+ if denied: return denied
  if session.get("role")!="super_admin": return ("Forbidden — Super Admin only",403)
 @app.get("/lang/<lang>")
 def lang(lang):
@@ -330,15 +382,48 @@ def residents():
  if request.method=="POST":
   if request.form.get("action")=="edit":
    if session.get("role")!="super_admin": c.close(); return ("Forbidden — Super Admin only",403)
-   rid=int(request.form["rid"])
-   c.execute("UPDATE residents SET year=?,repeat_year=?,status=? WHERE id=?",(int(request.form["year"]),int(request.form.get("repeat_year","0")),request.form["status"],rid))
-   audit_event(c,"resident.updated",f"resident_id={rid}; year={request.form['year']}; status={request.form['status']}")
+   try:
+    rid=int(request.form["rid"])
+    year=int(request.form.get("year","0"))
+    repeat_year=request.form.get("repeat_year","0")
+    status=request.form.get("status","")
+   except (TypeError,ValueError):
+    flash("Invalid resident update.")
+   else:
+    target=c.execute("SELECT status,year FROM residents WHERE id=?",(rid,)).fetchone()
+    if not target:
+     flash("Resident not found.")
+    elif target["status"]=="graduated":
+     flash("Graduated residents are archived; status cannot be changed here.")
+    elif year not in (1,2,3,4) or repeat_year not in ("0","1") or status not in ("active","inactive"):
+     flash("Year, repeat flag or status is invalid. DEMS graduation must use the official archive workflow.")
+    elif year!=target["year"]:
+     flash("Study-year changes must use the official exam/promotion workflow.")
+    else:
+     c.execute("UPDATE residents SET year=?,repeat_year=?,status=? WHERE id=?",(year,int(repeat_year),status,rid))
+     audit_event(c,"resident.updated",f"resident_id={rid}; year={year}; status={status}")
+     c.commit(); flash(tr("done"))
   else:
-   c.execute("INSERT INTO residents(surname,firstname,year,phone,repeat_year,status) VALUES(?,?,?,?,?,?)",(request.form["surname"].strip(),request.form["firstname"].strip(),int(request.form["year"]),request.form.get("phone",""),int(request.form.get("repeat_year","0")),"active"))
-   audit_event(c,"resident.created",request.form["surname"].strip()+" "+request.form["firstname"].strip())
-  c.commit(); flash(tr("done"))
+   if session.get("role")!="super_admin":
+    c.close(); return ("Forbidden — Super Admin only",403)
+   surname=request.form.get("surname","").strip()
+   firstname=request.form.get("firstname","").strip()
+   phone=request.form.get("phone","").strip()
+   repeat_year=request.form.get("repeat_year","0")
+   try: year=int(request.form.get("year","0"))
+   except (TypeError,ValueError): year=0
+   if not surname or not firstname or len(surname)>100 or len(firstname)>100 or year not in (1,2,3,4):
+    flash("Surname and first name are required (max 100 characters) and a valid study year is required.")
+   elif len(phone)>40 or repeat_year not in ("0","1"):
+    flash("Phone must be at most 40 characters and repeat flag must be 0 or 1.")
+   elif c.execute("SELECT 1 FROM residents WHERE lower(surname)=lower(?) AND lower(firstname)=lower(?) AND year=?",(surname,firstname,year)).fetchone():
+    flash("A resident with the same name and study year already exists.")
+   else:
+    c.execute("INSERT INTO residents(surname,firstname,year,phone,repeat_year,status) VALUES(?,?,?,?,?,?)",(surname,firstname,year,phone,int(repeat_year),"active"))
+    audit_event(c,"resident.created",surname+" "+firstname)
+    c.commit(); flash(tr("done"))
  rows=c.execute("SELECT * FROM residents ORDER BY status DESC,year DESC,surname").fetchall(); c.close()
- return page("""<section><h3>{{t('add')}} — {{t('resident')}}</h3><form method="post"><div class="grid"><div><label>{{t('surname')}}</label><input name="surname" required></div><div><label>{{t('firstname')}}</label><input name="firstname" required></div><div><label>{{t('study_year')}}</label><select name="year">{% for y in range(1,5) %}<option>{{y}}</option>{% endfor %}</select></div><div><label>{{t('phone')}}</label><input name="phone"></div></div><label><input type="checkbox" name="repeat_year" value="1"> {{t('repeat')}}</label><button>{{t('add')}}</button></form></section><section><div class="wrap"><table><tr><th>{{t('resident')}}</th><th>{{t('study_year')}}</th><th>{{t('save')}}</th></tr>{% for r in rows %}<tr><td><a href="/profile/{{r.id}}">{{r.surname}} {{r.firstname}}</a></td><td>{{r.year}}</td><td><form method="post"><input type="hidden" name="action" value="edit"><input type="hidden" name="rid" value="{{r.id}}"><select name="year">{% for y in range(1,5) %}<option value="{{y}}" {% if r.year==y %}selected{% endif %}>{{y}}</option>{% endfor %}</select><label><input type="checkbox" name="repeat_year" value="1" {% if r.repeat_year %}checked{% endif %}> {{t('repeat')}}</label><select name="status"><option value="active" {% if r.status=='active' %}selected{% endif %}>{{t('active')}}</option><option value="inactive" {% if r.status=='inactive' %}selected{% endif %}>{{t('inactive')}}</option><option value="graduated" {% if r.status=='graduated' %}selected{% endif %}>Graduated / Diplômé / متخرج</option></select><button>{{t('save')}}</button></form></td></tr>{% endfor %}</table></div></section>""",rows=rows)
+ return page("""<section><h3>{{t('add')}} — {{t('resident')}}</h3><form method="post"><div class="grid"><div><label>{{t('surname')}}</label><input name="surname" required></div><div><label>{{t('firstname')}}</label><input name="firstname" required></div><div><label>{{t('study_year')}}</label><select name="year">{% for y in range(1,5) %}<option>{{y}}</option>{% endfor %}</select></div><div><label>{{t('phone')}}</label><input name="phone"></div></div><label><input type="checkbox" name="repeat_year" value="1"> {{t('repeat')}}</label><button>{{t('add')}}</button></form></section><section><div class="wrap"><table><tr><th>{{t('resident')}}</th><th>{{t('study_year')}}</th><th>{{t('save')}}</th></tr>{% for r in rows %}<tr><td><a href="/profile/{{r.id}}">{{r.surname}} {{r.firstname}}</a></td><td>{{r.year}}</td><td>{% if r.status=='graduated' %}<span>Graduated — DEMS archive</span>{% else %}<form method="post"><input type="hidden" name="action" value="edit"><input type="hidden" name="rid" value="{{r.id}}"><span>Year {{r.year}}</span><input type="hidden" name="year" value="{{r.year}}"><label><input type="checkbox" name="repeat_year" value="1" {% if r.repeat_year %}checked{% endif %}> {{t('repeat')}}</label><select name="status"><option value="active" {% if r.status=='active' %}selected{% endif %}>{{t('active')}}</option><option value="inactive" {% if r.status=='inactive' %}selected{% endif %}>{{t('inactive')}}</option></select><button>{{t('save')}}</button></form>{% endif %}</td></tr>{% endfor %}</table></div></section>""",rows=rows)
 @app.route("/terrains",methods=["GET","POST"])
 def terrains():
  if guard(): return redirect("/login")
@@ -350,10 +435,17 @@ def terrains():
    if action=="edit":
     tid=int(request.form["tid"]); name=request.form["name"].strip(); kind=request.form["kind"]; mandatory_year=int(request.form["mandatory_year"])
     if not name or kind not in ("mandatory","basic","optional") or mandatory_year not in (0,1,2,3,4): raise ValueError("Invalid terrain fields")
+    current=c.execute("SELECT * FROM terrains WHERE id=?",(tid,)).fetchone()
+    if not current: raise ValueError("Terrain not found.")
+    has_records=c.execute("SELECT (SELECT COUNT(*) FROM history WHERE terrain_id=?)+(SELECT COUNT(*) FROM assignments WHERE terrain_id=?)",(tid,tid)).fetchone()[0]>0
+    if has_records and (kind!=current["kind"] or mandatory_year!=current["mandatory_year"]):
+     raise ValueError("Terrain classification/year cannot be changed after rotation history or assignments exist. Preserve the audit trail and correct it before use or via a reviewed migration.")
     c.execute("UPDATE terrains SET name=?,kind=?,mandatory_year=? WHERE id=?",(name,kind,mandatory_year,tid))
     audit_event(c,"terrain.updated",f"terrain_id={tid}; name={name}; kind={kind}; mandatory_year={mandatory_year}")
    elif action in ("deactivate","activate"):
     tid=int(request.form["tid"]); active=0 if action=="deactivate" else 1
+    current=c.execute("SELECT * FROM terrains WHERE id=?",(tid,)).fetchone()
+    if not current: raise ValueError("Terrain not found.")
     c.execute("UPDATE terrains SET active=? WHERE id=?",(active,tid))
     audit_event(c,"terrain.deactivated" if not active else "terrain.activated",f"terrain_id={tid}")
    else:
@@ -372,13 +464,21 @@ def capacities():
  c=db(); y=setting(c,"year")
  if request.method=="POST":
   if session.get("role")!="super_admin": c.close(); return ("Forbidden — Super Admin only",403)
-  tid,pid,places=int(request.form["terrain"]),int(request.form["period"]),max(0,int(request.form["places"]))
-  used=c.execute("SELECT COUNT(*) FROM assignments WHERE terrain_id=? AND period_id=? AND status IN ('confirmed','pending')",(tid,pid)).fetchone()[0]
-  if places<used: flash(tr("full"))
-  else:
-   c.execute("INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,?) ON CONFLICT(year_label,terrain_id,period_id) DO UPDATE SET places=excluded.places",(y,tid,pid,places))
-   audit_event(c,"capacity.changed",f"year={y}; terrain_id={tid}; period_id={pid}; places={places}")
-   c.commit(); flash(tr("done"))
+  try:
+   tid=int(request.form["terrain"]); pid=int(request.form["period"]); places=int(request.form["places"])
+   if places<0: raise ValueError("Capacity cannot be negative.")
+   terrain=c.execute("SELECT id FROM terrains WHERE id=? AND active=1",(tid,)).fetchone()
+   period=c.execute("SELECT id FROM periods WHERE id=? AND year_label=?",(pid,y)).fetchone()
+   if not terrain: raise ValueError("Choose an active terrain.")
+   if not period: raise ValueError("Choose a rotation period from the selected academic year.")
+   used=c.execute("SELECT COUNT(*) FROM assignments WHERE terrain_id=? AND period_id=? AND status IN ('confirmed','pending')",(tid,pid)).fetchone()[0]
+   if places<used: flash(tr("full"))
+   else:
+    c.execute("INSERT INTO capacities(year_label,terrain_id,period_id,places) VALUES(?,?,?,?) ON CONFLICT(year_label,terrain_id,period_id) DO UPDATE SET places=excluded.places",(y,tid,pid,places))
+    audit_event(c,"capacity.changed",f"year={y}; terrain_id={tid}; period_id={pid}; places={places}")
+    c.commit(); flash(tr("done"))
+  except (ValueError,TypeError,KeyError):
+   c.rollback(); flash("Invalid capacity input. Choose an active terrain, a period in the selected academic year, and a non-negative whole number of places.")
  ts=c.execute("SELECT * FROM terrains WHERE active=1 ORDER BY CASE WHEN kind='optional' THEN 1 ELSE 0 END, name").fetchall(); ps=c.execute("SELECT * FROM periods WHERE year_label=? ORDER BY id",(y,)).fetchall()
  rows=c.execute("SELECT t.name terrain,p.name period,cap.places,(SELECT COUNT(*) FROM assignments a WHERE a.terrain_id=t.id AND a.period_id=p.id AND a.status IN ('confirmed','pending')) used FROM capacities cap JOIN terrains t ON t.id=cap.terrain_id JOIN periods p ON p.id=cap.period_id WHERE cap.year_label=?",(y,)).fetchall(); c.close()
  return page("""<section><h3>{{t('capacities')}}</h3><form method="post"><div class="grid"><div><label>{{t('terrain')}}</label><select name="terrain">{% for x in ts %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>{{t('period')}}</label><select name="period">{% for x in ps %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>{{t('places')}}</label><input type="number" min="0" name="places" required></div></div><button>{{t('save')}}</button></form></section><section><div class="wrap"><table><tr><th>{{t('period')}}</th><th>{{t('terrain')}}</th><th>{{t('places')}}</th><th>{{t('used')}}</th><th>{{t('remaining')}}</th></tr>{% for r in rows %}<tr><td>{{r.period}}</td><td>{{r.terrain}}</td><td>{{r.places}}</td><td>{{r.used}}</td><td>{{r.places-r.used}}</td></tr>{% endfor %}</table></div></section>""",ts=ts,ps=ps,rows=rows)
@@ -391,24 +491,49 @@ def check(c,rid,tid,pid,y):
  dup=c.execute("SELECT t.name FROM assignments a JOIN terrains t ON t.id=a.terrain_id WHERE a.resident_id=? AND a.period_id=? AND a.status IN ('confirmed','pending')",(rid,pid)).fetchone()
  if dup:return False,tr("duplicate")+dup["name"],None
  repeat = c.execute(
-  "SELECT t.name,p.name AS period FROM assignments a JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id WHERE a.resident_id=? AND a.terrain_id=? AND p.year_label=? AND a.period_id<>? AND a.status IN ('confirmed','pending') LIMIT 1",
-  (rid,tid,y,pid)
+  "SELECT t.name,p.name AS period,p.year_label FROM assignments a JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id WHERE a.resident_id=? AND a.terrain_id=? AND a.period_id<>? AND a.status IN ('confirmed','pending') LIMIT 1",
+  (rid,tid,pid)
  ).fetchone()
  total=c.execute(
-  "SELECT COUNT(*) FROM terrains WHERE kind IN ('mandatory','basic')"
+  "SELECT COUNT(*) FROM terrains WHERE kind IN ('mandatory','basic') AND active=1"
  ).fetchone()[0]
- done=c.execute("""
-  SELECT COUNT(DISTINCT terrain_id) FROM (
-   SELECT h.terrain_id FROM history h
-   JOIN terrains t ON t.id=h.terrain_id
-   WHERE h.resident_id=? AND t.kind IN ('mandatory','basic')
-   UNION
-   SELECT a.terrain_id FROM assignments a
-   JOIN terrains t ON t.id=a.terrain_id
-   WHERE a.resident_id=? AND a.status='confirmed'
-   AND t.kind IN ('mandatory','basic')
-  )
- """,(rid,rid)).fetchone()[0]
+ # Historical rows without an explicit completion date still need a completed period.
+ # A future academic year with a blank date is not proof that the rotation happened.
+ today=date.today()
+ completed_terrains=set()
+ history_rows=c.execute("""
+  SELECT h.terrain_id,h.year_label,h.period,h.date_done
+  FROM history h JOIN terrains t ON t.id=h.terrain_id
+  WHERE h.resident_id=? AND t.kind IN ('mandatory','basic') AND t.active=1
+ """,(rid,)).fetchall()
+ for history_row in history_rows:
+  done_date=str(history_row["date_done"] or "").strip()
+  if done_date:
+   try:
+    if date.fromisoformat(done_date)<=today:
+     completed_terrains.add(history_row["terrain_id"])
+   except ValueError:
+    continue
+  else:
+   try:
+    _,history_period_end=rotation_period_bounds(history_row["year_label"],history_row["period"])
+    if history_period_end<today:
+     completed_terrains.add(history_row["terrain_id"])
+   except (ValueError,TypeError):
+    continue
+ # A confirmed assignment is completion evidence only after its rotation period has ended.
+ # Future/current assignments must not unlock repetition of mandatory terrains.
+ completed_assignments=c.execute("""
+  SELECT a.terrain_id,p.year_label,p.name FROM assignments a
+  JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id
+  WHERE a.resident_id=? AND a.status='confirmed'
+    AND t.kind IN ('mandatory','basic') AND t.active=1
+ """,(rid,)).fetchall()
+ for completed in completed_assignments:
+  _,period_end=rotation_period_bounds(completed["year_label"],completed["name"])
+  if period_end<today:
+   completed_terrains.add(completed["terrain_id"])
+ done=len(completed_terrains)
  if repeat and done<total:
   return False,tr("same_terrain_year")+repeat["name"]+" — "+repeat["period"],None
  cap=c.execute("SELECT places FROM capacities WHERE year_label=? AND terrain_id=? AND period_id=?",(y,tid,pid)).fetchone()
@@ -424,6 +549,8 @@ def assign():
  if guard():return redirect("/login")
  c=db(); y=setting(c,"year")
  if request.method=="POST":
+  if session.get("role")!="super_admin":
+   c.close(); return ("Forbidden — Super Admin only",403)
   try:
    rid,tid,pid=map(int,(request.form["resident"],request.form["terrain"],request.form["period"])); ok,msg,status=check(c,rid,tid,pid,y)
    if not ok: flash(msg)
@@ -450,7 +577,7 @@ def assign():
     blocked.append(str(p["id"]))
   blocked_periods_by_resident[r["id"]]=",".join(blocked)
  rows=c.execute("SELECT a.*,r.surname,r.firstname,r.year,t.name terrain,p.name period FROM assignments a JOIN residents r ON r.id=a.resident_id JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id WHERE p.year_label=? ORDER BY p.id,r.year DESC",(y,)).fetchall(); c.close()
- return page("""<section><h3>{{t('assign_now')}}</h3><p>{{t('priority')}}</p><form method="post"><label>{{t('resident')}}</label><select name="resident" id="assignment-resident">{% for r in rs %}<option value="{{r.id}}" data-blocked-periods="{{blocked_periods_by_resident[r.id]}}" data-base-label="{{r.year}} — {{r.surname}} {{r.firstname}}">{{r.year}} — {{r.surname}} {{r.firstname}}</option>{% endfor %}</select><label>{{t('terrain')}}</label><select name="terrain">{% for x in ts %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><label>{{t('period')}}</label><select name="period" id="assignment-period">{% for x in ps %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><button>{{t('check_save')}}</button></form><script>(function(){const p=document.getElementById("assignment-period"),r=document.getElementById("assignment-resident");if(!p||!r)return;function update(){const pid=p.value;Array.from(r.options).forEach(o=>{const blocked=(o.dataset.blockedPeriods||"").split(",").includes(pid);o.disabled=blocked;o.textContent=o.dataset.baseLabel+(blocked?" — External rotation conflict":"");});if(r.selectedOptions.length&&r.selectedOptions[0].disabled){const next=Array.from(r.options).find(o=>!o.disabled);if(next)r.value=next.value;}}p.addEventListener("change",update);update();})();</script></section><section><div class="wrap"><table><tr><th>{{t('period')}}</th><th>{{t('resident')}}</th><th>{{t('study_year')}}</th><th>{{t('terrain')}}</th><th>{{t('status')}}</th><th>Admin action</th></tr>{% for a in rows %}<tr><td>{{a.period}}</td><td>{{a.surname}} {{a.firstname}}</td><td>{{a.year}}</td><td>{{a.terrain}}</td><td>{{t(a.status) if a.status in ['confirmed','pending','rejected'] else a.status}}</td><td>{% if role=='super_admin' and a.status not in ['cancelled','rejected'] %}<form method="post" action="/assignments/{{a.id}}/cancel"><button>Cancel</button></form>{% endif %}</td></tr>{% endfor %}</table></div></section>""",rs=rs,ts=ts,ps=ps,rows=rows,blocked_periods_by_resident=blocked_periods_by_resident)
+ return page("""<section class="rt-assignment-hero"><h2>{% if lang=='ar' %}تخطيط التربصات وتعيين المقيمين{% elif lang=='fr' %}Planification et affectation des résidents{% else %}Rotation planning & resident assignment{% endif %}</h2><p>{{t('priority')}}</p><div class="rt-assignment-stats"><div><span>{% if lang=='ar' %}المقيمون النشطون{% elif lang=='fr' %}Résidents actifs{% else %}Active residents{% endif %}</span><strong>{{rs|length}}</strong></div><div><span>{% if lang=='ar' %}التخصصات / الأراضي{% elif lang=='fr' %}Terrains actifs{% else %}Active rotations{% endif %}</span><strong>{{ts|length}}</strong></div><div><span>{% if lang=='ar' %}الفترات المتاحة{% elif lang=='fr' %}Périodes{% else %}Periods{% endif %}</span><strong>{{ps|length}}</strong></div><div><span>{% if lang=='ar' %}التعيينات في السنة{% elif lang=='fr' %}Affectations cette année{% else %}Assignments this year{% endif %}</span><strong>{{rows|length}}</strong></div></div></section>{% if role=='super_admin' %}<section class="rt-assignment-form"><h3>{% if lang=='ar' %}تعيين جديد{% elif lang=='fr' %}Nouvelle affectation{% else %}Create an assignment{% endif %}</h3><p class="muted">{% if lang=='ar' %}الأولوية حسب السنة: الرابعة، ثم الثالثة، الثانية، فالأولى. يتم إظهار تعارضات التربص الخارجي باللون الأحمر.{% elif lang=='fr' %}Priorité : 4e année, puis 3e, 2e et 1re année. Les conflits de stages externes sont signalés en rouge.{% else %}Priority order: Year 4, then Year 3, Year 2, and Year 1. External rotation conflicts are marked in red.{% endif %}</p><label for="assignment-search">{% if lang=='ar' %}ابحث عن مقيم{% elif lang=='fr' %}Rechercher un résident{% else %}Find a resident{% endif %}</label><input id="assignment-search" type="search" placeholder="{% if lang=='ar' %}الاسم أو اللقب...{% elif lang=='fr' %}Nom ou prénom...{% else %}Name or surname...{% endif %}"><label for="assignment-year-filter">{% if lang=='ar' %}تصفية حسب السنة{% elif lang=='fr' %}Filtrer par année{% else %}Filter by year{% endif %}</label><select id="assignment-year-filter"><option value="all">{% if lang=='ar' %}كل السنوات{% elif lang=='fr' %}Toutes les années{% else %}All years{% endif %}</option>{% for y in [4,3,2,1] %}<option value="{{y}}">{% if lang=='ar' %}السنة{% elif lang=='fr' %}Année{% else %}Year{% endif %} {{y}}</option>{% endfor %}</select><form method="post" id="assignment-form"><label for="assignment-resident">{{t('resident')}}</label><select name="resident" id="assignment-resident" required>{% for r in rs %}<option value="{{r.id}}" data-year="{{r.year}}" data-blocked-periods="{{blocked_periods_by_resident[r.id]}}" data-base-label="{{r.year}} — {{r.surname}} {{r.firstname}}">{{r.year}} — {{r.surname}} {{r.firstname}}</option>{% endfor %}</select><p id="assignment-conflict" class="rt-assignment-notice" role="status" aria-live="polite"></p><label for="assignment-terrain">{{t('terrain')}}</label><select name="terrain" id="assignment-terrain" required>{% for x in ts %}<option value="{{x.id}}" data-kind="{{x.kind}}">{{x.name}}{% if x.kind=='optional' %} — {% if lang=='ar' %}اختياري{% elif lang=='fr' %}Optionnel{% else %}Optional{% endif %}{% endif %}</option>{% endfor %}</select><label for="assignment-period">{{t('period')}}</label><select name="period" id="assignment-period" required>{% for x in ps %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><button type="submit">{{t('check_save')}}</button></form><script>(function(){const p=document.getElementById("assignment-period"),r=document.getElementById("assignment-resident"),search=document.getElementById("assignment-search"),year=document.getElementById("assignment-year-filter"),notice=document.getElementById("assignment-conflict");if(!p||!r)return;const options=Array.from(r.options);function update(){const pid=p.value,term=(search.value||"").toLocaleLowerCase(),yr=year.value;let visible=0;options.forEach(o=>{const blocked=(o.dataset.blockedPeriods||"").split(",").includes(pid),matchesName=(o.dataset.baseLabel||"").toLocaleLowerCase().includes(term),matchesYear=yr==="all"||o.dataset.year===yr;o.disabled=blocked||!matchesName||!matchesYear;o.hidden=!matchesName||!matchesYear;o.textContent=o.dataset.baseLabel+(blocked?" — ⚠ External rotation conflict":"");if(!o.disabled)visible++;});if(r.selectedOptions.length&&r.selectedOptions[0].disabled){const next=options.find(o=>!o.disabled);if(next)r.value=next.value;}const selected=r.selectedOptions[0],blocked=selected&&(selected.dataset.blockedPeriods||"").split(",").includes(pid);if(blocked){notice.className="rt-assignment-notice is-conflict";notice.textContent="{% if lang=='ar' %}تعارض: هذا المقيم لديه تربص خارجي في هذه الفترة.{% elif lang=='fr' %}Conflit : ce résident a un stage externe pendant cette période.{% else %}Conflict: this resident has an external rotation during this period.{% endif %}";}else{notice.className="rt-assignment-notice";notice.textContent=visible===0?"{% if lang=='ar' %}لا يوجد مقيم مطابق للفلاتر في هذه الفترة.{% elif lang=='fr' %}Aucun résident ne correspond aux filtres pour cette période.{% else %}No residents match these filters for this period.{% endif %}":"";}}p.addEventListener("change",update);search.addEventListener("input",update);year.addEventListener("change",update);update();})();</script></section>{% else %}<section><p>{% if lang=='ar' %}إنشاء التعيينات متاح للمسؤول العام فقط.{% elif lang=='fr' %}La création des affectations est réservée aux Super Admins.{% else %}Only Super Admins can create assignments.{% endif %}</p></section>{% endif %}<section><h3>{% if lang=='ar' %}التعيينات الحالية{% elif lang=='fr' %}Affectations actuelles{% else %}Current assignments{% endif %}</h3><div class="wrap"><table class="rt-assignment-table"><thead><tr><th>{{t('period')}}</th><th>{{t('resident')}}</th><th>{{t('study_year')}}</th><th>{{t('terrain')}}</th><th>{{t('status')}}</th><th>{% if lang=='ar' %}إجراء إداري{% elif lang=='fr' %}Action admin{% else %}Admin action{% endif %}</th></tr></thead><tbody>{% for a in rows %}<tr class="{% if a.status=='pending' %}is-pending{% elif a.status=='rejected' or a.status=='cancelled' %}is-inactive{% else %}is-confirmed{% endif %}"><td>{{a.period}}</td><td>{{a.surname}} {{a.firstname}}</td><td><span class="rt-year-badge">{{a.year}}</span></td><td>{{a.terrain}}</td><td><span class="rt-status-pill status-{{a.status}}">{{t(a.status) if a.status in ['confirmed','pending','rejected'] else a.status}}</span></td><td>{% if role=='super_admin' and a.status not in ['cancelled','rejected'] %}<form method="post" action="/assignments/{{a.id}}/cancel"><button class="rt-danger-button" type="submit">{% if lang=='ar' %}إلغاء{% elif lang=='fr' %}Annuler{% else %}Cancel{% endif %}</button></form>{% else %}—{% endif %}</td></tr>{% else %}<tr><td colspan="6">{% if lang=='ar' %}لا توجد تعيينات بعد.{% elif lang=='fr' %}Aucune affectation pour le moment.{% else %}No assignments yet.{% endif %}</td></tr>{% endfor %}</tbody></table></div></section><style>.rt-assignment-hero h2{margin-top:0}.rt-assignment-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.rt-assignment-stats>div{padding:12px;border:1px solid #155173;border-radius:13px;background:#071e33}.rt-assignment-stats span{display:block;font-size:12px;color:#a9ccdf}.rt-assignment-stats strong{display:block;font-size:25px;color:#27d8ce}.rt-assignment-notice{min-height:0;margin:0;padding:0;color:#a9ccdf}.rt-assignment-notice.is-conflict{margin:6px 0;padding:10px;border:1px solid #ff6d77;border-radius:10px;background:#531c2a;color:#ffe5e7;font-weight:700}.rt-assignment-table .is-pending td{border-top:2px solid #ffbd61}.rt-assignment-table .is-inactive td{opacity:.7}.rt-year-badge{display:inline-block;min-width:30px;padding:4px 8px;border-radius:8px;background:#0b4c69;color:#8ff5f4;text-align:center;font-weight:700}.rt-status-pill{display:inline-block;padding:4px 8px;border-radius:20px;font-size:12px;font-weight:700}.status-confirmed{background:#064c3e;color:#a7f3d0}.status-pending{background:#624013;color:#ffe0a3}.status-rejected,.status-cancelled{background:#5b1f2b;color:#ffc1c8}.rt-danger-button{background:#762536!important;border-color:#d64f67!important}@media(max-width:680px){.rt-assignment-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.rt-assignment-stats strong{font-size:21px}} </style>""",rs=rs,ts=ts,ps=ps,rows=rows,blocked_periods_by_resident=blocked_periods_by_resident)
 @app.post("/assignments/<int:aid>/cancel")
 def cancel_assignment(aid):
  if super_guard(): return super_guard()
@@ -470,12 +597,33 @@ def history():
  c=db()
  if request.method=="POST":
   if session.get("role")!="super_admin": c.close(); return ("Forbidden — Super Admin only",403)
-  rid=int(request.form["resident"]); tid=int(request.form["terrain"])
-  c.execute("INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",(rid,tid,request.form["year_label"],request.form.get("period",""),request.form.get("date_done","")))
-  audit_event(c,"history.created",f"resident_id={rid}; terrain_id={tid}; year={request.form['year_label']}")
-  c.commit(); flash(tr("done"))
+  try:
+   rid=int(request.form["resident"]); tid=int(request.form["terrain"])
+   year_label=request.form.get("year_label","").strip()
+   period=request.form.get("period","").strip()
+   date_done=request.form.get("date_done","").strip()
+   if not re.fullmatch(r"\d{4}-\d{4}",year_label) or int(year_label.split("-")[1])!=int(year_label.split("-")[0])+1:
+    raise ValueError("Academic year must be YYYY-YYYY with consecutive years.")
+   valid_periods={"01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"}
+   if period and period not in valid_periods:
+    raise ValueError("Choose one of the four official rotation periods.")
+   if date_done:
+    parsed_date=date.fromisoformat(date_done)
+    if parsed_date>date.today():
+     raise ValueError("A historical rotation date cannot be in the future.")
+   if not c.execute("SELECT 1 FROM residents WHERE id=?",(rid,)).fetchone():
+    raise ValueError("Resident does not exist.")
+   if not c.execute("SELECT 1 FROM terrains WHERE id=?",(tid,)).fetchone():
+    raise ValueError("Terrain does not exist.")
+   duplicate=c.execute("SELECT 1 FROM history WHERE resident_id=? AND terrain_id=? AND year_label=? AND period=? AND COALESCE(date_done,'')=?",(rid,tid,year_label,period,date_done)).fetchone()
+   if duplicate: raise ValueError("This historical rotation already exists.")
+   c.execute("INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",(rid,tid,year_label,period,date_done))
+   audit_event(c,"history.created",f"resident_id={rid}; terrain_id={tid}; year={year_label}; period={period}")
+   c.commit(); flash(tr("done"))
+  except (TypeError,ValueError,sqlite3.IntegrityError) as exc:
+   c.rollback(); flash(str(exc) or "Invalid historical rotation.")
  rs=c.execute("SELECT * FROM residents ORDER BY year DESC,surname").fetchall(); ts=c.execute("SELECT * FROM terrains WHERE active=1 ORDER BY CASE WHEN kind='optional' THEN 1 ELSE 0 END, name").fetchall(); rows=c.execute("SELECT h.*,r.surname,r.firstname,t.name terrain FROM history h JOIN residents r ON r.id=h.resident_id JOIN terrains t ON t.id=h.terrain_id ORDER BY h.id DESC").fetchall(); c.close()
- return page("""<section><h3>{{t('history_add')}}</h3><form method="post"><label>{{t('resident')}}</label><select name="resident">{% for r in rs %}<option value="{{r.id}}">{{r.surname}} {{r.firstname}} — {{r.year}}</option>{% endfor %}</select><label>{{t('terrain')}}</label><select name="terrain">{% for x in ts %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><label>{{t('academic_year')}}</label><input name="year_label" required placeholder="2025-2026"><label>{{t('period')}}</label><input name="period"><label>{{t('date')}}</label><input type="date" name="date_done"><button>{{t('save')}}</button></form></section><section><div class="wrap"><table><tr><th>{{t('resident')}}</th><th>{{t('terrain')}}</th><th>{{t('academic_year')}}</th><th>{{t('period')}}</th><th>{{t('date')}}</th></tr>{% for h in rows %}<tr><td>{{h.surname}} {{h.firstname}}</td><td>{{h.terrain}}</td><td>{{h.year_label}}</td><td>{{h.period}}</td><td>{{h.date_done}}</td></tr>{% endfor %}</table></div></section>""",rs=rs,ts=ts,rows=rows)
+ return page("""<section><h3>{{t('history_add')}}</h3><form method="post"><label>{{t('resident')}}</label><select name="resident">{% for r in rs %}<option value="{{r.id}}">{{r.surname}} {{r.firstname}} — {{r.year}}</option>{% endfor %}</select><label>{{t('terrain')}}</label><select name="terrain">{% for x in ts %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><label>{{t('academic_year')}}</label><input name="year_label" required placeholder="2025-2026"><label>{{t('period')}}</label><select name="period"><option value="">—</option>{% for p in ["01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"] %}<option value="{{p}}">{{p}}</option>{% endfor %}</select><label>{{t('date')}}</label><input type="date" name="date_done"><button>{{t('save')}}</button></form></section><section><div class="wrap"><table><tr><th>{{t('resident')}}</th><th>{{t('terrain')}}</th><th>{{t('academic_year')}}</th><th>{{t('period')}}</th><th>{{t('date')}}</th></tr>{% for h in rows %}<tr><td>{{h.surname}} {{h.firstname}}</td><td>{{h.terrain}}</td><td>{{h.year_label}}</td><td>{{h.period}}</td><td>{{h.date_done}}</td></tr>{% endfor %}</table></div></section>""",rs=rs,ts=ts,rows=rows)
 @app.get("/summary")
 def summary():
  if guard():return redirect("/login")
@@ -490,19 +638,29 @@ def decisions():
  if super_guard():return super_guard()
  c=db()
  if request.method=="POST":
-  aid=int(request.form["aid"]); outcome=request.form["outcome"]; reason=request.form.get("reason","").strip()
+  aid=request.form.get("aid",type=int); outcome=request.form.get("outcome",""); reason=request.form.get("reason","").strip()
   if outcome not in ("approve","reject"): c.close(); return ("Invalid decision",400)
-  a=c.execute("SELECT a.*,r.surname,r.firstname,t.name terrain,p.name period,p.year_label FROM assignments a JOIN residents r ON r.id=a.resident_id JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id WHERE a.id=? AND a.status='pending'",(aid,)).fetchone()
+  a=c.execute("SELECT a.*,r.surname,r.firstname,r.status resident_status,t.name terrain,t.active terrain_active,p.name period,p.year_label FROM assignments a JOIN residents r ON r.id=a.resident_id JOIN terrains t ON t.id=a.terrain_id JOIN periods p ON p.id=a.period_id WHERE a.id=? AND a.status='pending'",(aid,)).fetchone()
   if a and reason:
    if outcome=="approve":
-    cap=c.execute("SELECT places FROM capacities WHERE year_label=? AND terrain_id=? AND period_id=?",(a["year_label"],a["terrain_id"],a["period_id"])).fetchone()
-    used=c.execute("SELECT COUNT(*) FROM assignments WHERE terrain_id=? AND period_id=? AND status='confirmed'",(a["terrain_id"],a["period_id"])).fetchone()[0]
-    dup=c.execute("SELECT id FROM assignments WHERE resident_id=? AND period_id=? AND id<>? AND status IN ('confirmed','pending')",(a["resident_id"],a["period_id"],aid)).fetchone()
-    if not cap or used>=cap["places"] or dup: flash(tr("full") if not dup else tr("duplicate"))
+    if a["resident_status"]!="active":
+     flash("Cannot approve: the resident is no longer active.")
+    elif not a["terrain_active"]:
+     flash("Cannot approve: the terrain has been deactivated.")
     else:
-     c.execute("UPDATE assignments SET status='confirmed' WHERE id=?",(aid,)); c.execute("INSERT INTO decisions(details,decision,reason,actor) VALUES(?,?,?,?)",(a["surname"]+" "+a["firstname"]+" — "+a["terrain"],tr("approve"),reason,session["user"]))
-     audit_event(c,"assignment.override_approved",f"assignment_id={aid}; reason={reason}")
-     c.commit(); flash(tr("done"))
+     start_day,end_day=rotation_period_bounds(a["year_label"],a["period"])
+     external=c.execute("SELECT hospital,country,start_date,end_date FROM external_rotations WHERE resident_id=? AND status<>'cancelled' AND start_date<=? AND end_date>=? LIMIT 1",(a["resident_id"],end_day.isoformat(),start_day.isoformat())).fetchone()
+     if external:
+      flash("Cannot approve: an external rotation overlaps this period.")
+     else:
+      cap=c.execute("SELECT places FROM capacities WHERE year_label=? AND terrain_id=? AND period_id=?",(a["year_label"],a["terrain_id"],a["period_id"])).fetchone()
+      used=c.execute("SELECT COUNT(*) FROM assignments WHERE terrain_id=? AND period_id=? AND status='confirmed'",(a["terrain_id"],a["period_id"])).fetchone()[0]
+      dup=c.execute("SELECT id FROM assignments WHERE resident_id=? AND period_id=? AND id<>? AND status IN ('confirmed','pending')",(a["resident_id"],a["period_id"],aid)).fetchone()
+      if not cap or used>=cap["places"] or dup: flash(tr("full") if not dup else tr("duplicate"))
+      else:
+       c.execute("UPDATE assignments SET status='confirmed' WHERE id=?",(aid,)); c.execute("INSERT INTO decisions(details,decision,reason,actor) VALUES(?,?,?,?)",(a["surname"]+" "+a["firstname"]+" — "+a["terrain"],tr("approve"),reason,session["user"]))
+       audit_event(c,"assignment.override_approved",f"assignment_id={aid}; reason={reason}")
+       c.commit(); flash(tr("done"))
    else:
     c.execute("UPDATE assignments SET status='rejected' WHERE id=?",(aid,)); c.execute("INSERT INTO decisions(details,decision,reason,actor) VALUES(?,?,?,?)",(a["surname"]+" "+a["firstname"]+" — "+a["terrain"],tr("reject"),reason,session["user"]))
     audit_event(c,"assignment.override_rejected",f"assignment_id={aid}; reason={reason}")
@@ -522,11 +680,14 @@ def settings():
    y=setting(c,"year")
   if y:
    c.execute("INSERT INTO settings(key,value) VALUES('year',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(y,))
-   if not c.execute("SELECT 1 FROM periods WHERE year_label=?",(y,)).fetchone():
-    for n in ["01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"]:c.execute("INSERT OR IGNORE INTO periods(year_label,name) VALUES(?,?)",(y,n))
+   for n in ["01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"]:
+    c.execute("INSERT OR IGNORE INTO periods(year_label,name) VALUES(?,?)",(y,n))
   d=request.form.get("director","").strip()
   if d:c.execute("INSERT INTO settings(key,value) VALUES('director',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(d,))
   pw=request.form.get("new_password","")
+  if pw and len(pw)<12:
+   flash("New password must be at least 12 characters.")
+   pw=""
   if pw:
    secure_hash=hash_password(pw)
    c.execute("INSERT INTO settings(key,value) VALUES('password',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(secure_hash,))
@@ -535,7 +696,7 @@ def settings():
   audit_event(c,"settings.updated",f"year={y}; director_updated={bool(d)}")
   c.commit(); flash(tr("done"))
  vals={r["key"]:r["value"] for r in c.execute("SELECT key,value FROM settings")}; c.close()
- return page("""<section><h3>{{t('settings')}}</h3><form method="post"><label>{{t('language')}}</label><select name="lang"><option value="ar" {% if lang=='ar' %}selected{% endif %}>العربية</option><option value="fr" {% if lang=='fr' %}selected{% endif %}>Français</option><option value="en" {% if lang=='en' %}selected{% endif %}>English</option></select><label>{{t('year')}}</label><input name="year" value="{{vals.get('year','')}}" required><label>{{t('director')}}</label><input name="director" value="{{vals.get('director','')}}"><label>{{t('new_password')}}</label><input type="password" name="new_password"><button>{{t('change')}}</button></form><p class="muted">{{t('note')}}</p></section>""",vals=vals,lang=session.get("lang","ar"))
+ return page("""<section><h3>{{t('settings')}}</h3><form method="post"><label>{{t('language')}}</label><select name="lang"><option value="ar" {% if lang=='ar' %}selected{% endif %}>العربية</option><option value="fr" {% if lang=='fr' %}selected{% endif %}>Français</option><option value="en" {% if lang=='en' %}selected{% endif %}>English</option></select><label>{{t('year')}}</label><input name="year" value="{{vals.get('year','')}}" required><label>{{t('director')}}</label><input name="director" value="{{vals.get('director','')}}"><label>{{t('new_password')}}</label><input type="password" name="new_password" minlength="12" autocomplete="new-password"><button>{{t('change')}}</button></form><p class="muted">{{t('note')}}</p></section>""",vals=vals,lang=session.get("lang","ar"))
 @app.route("/users",methods=["GET","POST"])
 def manage_users():
  if super_guard(): return super_guard()
@@ -543,7 +704,7 @@ def manage_users():
  if request.method=="POST":
   action=request.form.get("action","create")
   if action in ("deactivate","activate"):
-   uid=int(request.form["user_id"])
+   uid=request.form.get("user_id",type=int)
    target=c.execute("SELECT * FROM users WHERE id=?",(uid,)).fetchone()
    if not target: flash("User not found.")
    elif action=="deactivate" and target["username"].lower() in ("benhocine","drdris"): flash("Official accounts cannot be deactivated.")
@@ -585,10 +746,15 @@ def normalize_header(value):
   "year":"year","study year":"year","année":"year","annee":"year","niveau":"year","السنة":"year",
   "phone":"phone","telephone":"phone","téléphone":"phone","mobile":"phone","الهاتف":"phone",
   "birth place":"birth_place","lieu de naissance":"birth_place","مكان الميلاد":"birth_place",
-  "birth date":"birth_date","date de naissance":"birth_date","تاريخ الميلاد":"birth_date"
+  "birth date":"birth_date","date de naissance":"birth_date","تاريخ الميلاد":"birth_date",
+  "resident":"resident","resident name":"resident","resident full name":"resident","nom du résident":"resident","nom resident":"resident","المقيم":"resident",
+  "terrain":"terrain","service":"terrain","stage":"terrain","rotation":"terrain","service de stage":"terrain","المصلحة":"terrain","التربص":"terrain",
+  "academic year":"year_label","year label":"year_label","academic year label":"year_label","année universitaire":"year_label","annee universitaire":"year_label","السنة الجامعية":"year_label",
+  "period":"period","rotation period":"period","période":"period","periode":"period","الفترة":"period",
+  "date done":"date_done","completion date":"date_done","date completed":"date_done","date de réalisation":"date_done","date de fin":"date_done","تاريخ الإنجاز":"date_done"
  }
  return aliases.get(value,value.replace(" ","_"))
-def parse_import_file(path, extension):
+def parse_import_file(path, extension, import_type='residents'):
  rows=[]
  if extension==".csv":
   with open(path,"r",encoding="utf-8-sig",newline="") as handle:
@@ -638,8 +804,10 @@ def parse_import_file(path, extension):
   rows=[re.split(r"\s*[,;\t]\s*",line) for line in lines]
  if not rows: raise ValueError("No table rows could be read from this file.")
  header=[normalize_header(x) for x in rows[0]]
- required={"surname","firstname","year"}
+ required={"resident","terrain","year_label"} if import_type=="history" else {"surname","firstname","year"}
  if not required.issubset(set(header)):
+  if import_type=="history":
+   raise ValueError("History import requires resident name, terrain/service, and academic year (YYYY-YYYY) columns; period and completion date are optional.")
   raise ValueError("Missing required columns. Include surname/nom/اللقب, firstname/prénom/الاسم, and year/année/السنة in the first row.")
  parsed=[]
  for line_number,values in enumerate(rows[1:],start=2):
@@ -668,11 +836,41 @@ def import_residents():
    rows=json.loads(preview["rows_json"]); errors=json.loads(preview["errors_json"])
    if errors:
     c.close(); flash("Fix the invalid rows in the source file before importing."); return redirect("/import")
-   inserted=0
+   # Re-check against live data at confirmation: another administrator may have
+   # created one of these residents after the preview was generated.
+   seen=set(); confirmation_errors=[]
    for row in rows:
-    c.execute("INSERT INTO residents(surname,firstname,year,phone,birth_place,birth_date,status) VALUES(?,?,?,?,?,?, 'active')",
-      (row["surname"],row["firstname"],int(row["year"]),row.get("phone",""),row.get("birth_place",""),row.get("birth_date","")))
-    inserted+=1
+    surname=str(row.get("surname","")).strip()
+    firstname=str(row.get("firstname","")).strip()
+    try:
+     year=int(row.get("year"))
+     if year not in (1,2,3,4): raise ValueError()
+    except (ValueError,TypeError):
+     confirmation_errors.append({"row":row.get("row_number"),"message":"Year must be 1, 2, 3 or 4."})
+     continue
+    key=(surname.casefold(),firstname.casefold(),year)
+    if not surname or not firstname:
+     confirmation_errors.append({"row":row.get("row_number"),"message":"Surname and first name are required."})
+    elif key in seen:
+     confirmation_errors.append({"row":row.get("row_number"),"message":"Duplicate resident row in this file."})
+    elif c.execute("SELECT 1 FROM residents WHERE lower(surname)=lower(?) AND lower(firstname)=lower(?) AND year=?",(surname,firstname,year)).fetchone():
+     confirmation_errors.append({"row":row.get("row_number"),"message":"Resident with same name and year already exists; upload a fresh preview."})
+    seen.add(key)
+   if confirmation_errors:
+    c.execute("UPDATE import_previews SET errors_json=? WHERE id=?",(json.dumps(confirmation_errors,ensure_ascii=False),preview_id))
+    c.commit(); c.close()
+    flash("The resident list changed after preview. Nothing was imported; upload the file again to review the current data.")
+    return redirect("/import")
+   inserted=0
+   try:
+    for row in rows:
+     c.execute("INSERT INTO residents(surname,firstname,year,phone,birth_place,birth_date,status) VALUES(?,?,?,?,?,?, 'active')",
+       (row["surname"],row["firstname"],int(row["year"]),row.get("phone",""),row.get("birth_place",""),row.get("birth_date","")))
+     inserted+=1
+   except sqlite3.IntegrityError:
+    c.rollback(); c.close()
+    flash("Import cancelled because the resident data changed during confirmation. Nothing was imported; upload a fresh preview.")
+    return redirect("/import")
    audit_event(c,"residents.imported",f"filename={preview['filename']}; imported={inserted}; history_not_imported=true")
    c.execute("DELETE FROM import_previews WHERE id=?",(preview_id,)); c.commit(); c.close()
    flash(f"Imported {inserted} residents. No past rotations were invented or imported.")
@@ -695,7 +893,9 @@ def import_residents():
     surname=row.get("surname","").strip(); firstname=row.get("firstname","").strip()
     if not surname or not firstname: row_errors.append("Surname and first name are required.")
     try:
-     year=int(float(row.get("year","")))
+     numeric_year=float(row.get("year",""))
+     if not numeric_year.is_integer(): raise ValueError()
+     year=int(numeric_year)
      if year not in (1,2,3,4): raise ValueError()
      row["year"]=year
     except (ValueError,TypeError): row_errors.append("Year must be 1, 2, 3 or 4.")
@@ -717,7 +917,122 @@ def import_residents():
   finally:
    if staged and os.path.exists(staged): os.remove(staged)
  c.close()
- return page("""<section><h3>{{t('import')}}</h3><p>{{t('import_help')}} Supported: CSV, XLS/XLSX, DOC/DOCX and text-based PDF.</p><form method="post" enctype="multipart/form-data"><label>{{t('file')}}</label><input type="file" name="file" accept=".csv,.xls,.xlsx,.doc,.docx,.pdf" required><button>{{t('upload_preview')}}</button></form></section>""")
+ return page("""<section><h3>{{t('import')}}</h3><p>{{t('import_help')}} Supported: CSV, XLS/XLSX, DOC/DOCX and text-based PDF.</p><form method="post" enctype="multipart/form-data"><label>{{t('file')}}</label><input type="file" name="file" accept=".csv,.xls,.xlsx,.doc,.docx,.pdf" required><button>{{t('upload_preview')}}</button></form><p><a href="/import-history">Import documented past stages / Importer l’historique documenté / استيراد التربصات السابقة الموثقة</a></p></section>""")
+
+@app.route("/import-history",methods=["GET","POST"])
+def import_history():
+ if super_guard(): return super_guard()
+ c=db()
+ c.execute("DELETE FROM import_previews WHERE created_at < datetime('now','-1 day')"); c.commit()
+ if request.method=="POST":
+  action=request.form.get("action","upload")
+  if action in ("confirm","cancel"):
+   preview_id=request.form.get("preview_id",type=int)
+   preview=c.execute("SELECT * FROM import_previews WHERE id=? AND owner=? AND import_type='history'",(preview_id,session["user"])).fetchone()
+   if not preview:
+    c.close(); flash("History import preview expired or not found."); return redirect("/import-history")
+   if action=="cancel":
+    c.execute("DELETE FROM import_previews WHERE id=?",(preview_id,)); c.commit(); c.close(); flash("History import cancelled."); return redirect("/import-history")
+   rows=json.loads(preview["rows_json"]); errors=json.loads(preview["errors_json"])
+   if errors:
+    c.close(); flash("Fix all history validation errors before importing."); return redirect("/import-history")
+   seen=set(); validation=[]
+   for row in rows:
+    resident_name=str(row.get("resident","")).strip()
+    terrain_name=str(row.get("terrain","")).strip()
+    year_label=str(row.get("year_label","")).strip()
+    matches=c.execute("SELECT id,surname,firstname FROM residents WHERE lower(trim(surname||' '||firstname))=lower(?) OR lower(trim(firstname||' '||surname))=lower(?) OR lower(trim(surname||', '||firstname))=lower(?)",(resident_name,resident_name,resident_name)).fetchall()
+    terrains=c.execute("SELECT id,name FROM terrains WHERE lower(trim(name))=lower(?)",(terrain_name,)).fetchall()
+    if len(matches)!=1: validation.append({"row":row.get("row_number"),"message":"Resident no longer matches exactly one existing resident."}); continue
+    if len(terrains)!=1: validation.append({"row":row.get("row_number"),"message":"Terrain no longer matches exactly one existing terrain."}); continue
+    try:
+     if not re.fullmatch(r"\d{4}-\d{4}",year_label) or int(year_label.split("-")[1])!=int(year_label.split("-")[0])+1: raise ValueError("Academic year must use YYYY-YYYY with consecutive years.")
+     period=str(row.get("period","")).strip()
+     valid_periods={"01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"}
+     if period and period not in valid_periods: raise ValueError("Choose one of the four official periods or leave period blank.")
+     date_done=str(row.get("date_done","")).strip()
+     if date_done:
+      parsed=date.fromisoformat(date_done)
+      if parsed>date.today(): raise ValueError("A historical rotation date cannot be in the future.")
+    except ValueError as exc:
+     validation.append({"row":row.get("row_number"),"message":str(exc)}); continue
+    rid=matches[0]["id"]; tid=terrains[0]["id"]
+    key=(rid,tid,year_label,period,date_done)
+    if key in seen: validation.append({"row":row.get("row_number"),"message":"Duplicate history row in this file."})
+    elif c.execute("SELECT 1 FROM history WHERE resident_id=? AND terrain_id=? AND year_label=? AND COALESCE(period,'')=? AND COALESCE(date_done,'')=?",(rid,tid,year_label,period,date_done)).fetchone():
+     validation.append({"row":row.get("row_number"),"message":"This exact history record already exists; upload a fresh preview."})
+    seen.add(key)
+   if validation:
+    c.execute("UPDATE import_previews SET errors_json=? WHERE id=?",(json.dumps(validation,ensure_ascii=False),preview_id)); c.commit(); c.close()
+    flash("History changed after preview. Nothing was imported; upload the file again.")
+    return redirect("/import-history")
+   inserted=0
+   try:
+    for row in rows:
+     resident_name=str(row["resident"]).strip(); terrain_name=str(row["terrain"]).strip()
+     match=c.execute("SELECT id FROM residents WHERE lower(trim(surname||' '||firstname))=lower(?) OR lower(trim(firstname||' '||surname))=lower(?) OR lower(trim(surname||', '||firstname))=lower(?)",(resident_name,resident_name,resident_name)).fetchone()
+     terrain=c.execute("SELECT id FROM terrains WHERE lower(trim(name))=lower(?)",(terrain_name,)).fetchone()
+     c.execute("INSERT INTO history(resident_id,terrain_id,year_label,period,date_done) VALUES(?,?,?,?,?)",(match["id"],terrain["id"],row["year_label"],row.get("period",""),row.get("date_done","")))
+     inserted+=1
+   except sqlite3.IntegrityError:
+    c.rollback(); c.close(); flash("Import cancelled because history changed during confirmation. Nothing was imported; upload a fresh preview."); return redirect("/import-history")
+   audit_event(c,"history.imported",f"filename={preview['filename']}; imported={inserted}; documented_rows_only=true")
+   c.execute("DELETE FROM import_previews WHERE id=?",(preview_id,)); c.commit(); c.close()
+   flash(f"Imported {inserted} documented past-stage records. No history was invented.")
+   return redirect("/history")
+  upload=request.files.get("file")
+  if not upload or not upload.filename:
+   c.close(); flash("Choose a file first."); return redirect("/import-history")
+  filename=os.path.basename(upload.filename); extension=os.path.splitext(filename)[1].lower()
+  if extension not in {".csv",".xlsx",".xls",".docx",".doc",".pdf"}:
+   c.close(); flash("Supported formats: CSV, XLS/XLSX, DOC/DOCX and text-based PDF."); return redirect("/import-history")
+  staged=None
+  try:
+   with tempfile.NamedTemporaryFile(prefix="rotation_history_import_",suffix=extension,dir=os.path.dirname(os.path.abspath(DB)),delete=False) as temp:
+    staged=temp.name; upload.save(staged)
+   rows=parse_import_file(staged,extension,"history")
+   errors=[]; seen=set(); valid_periods={"01 Fév - 30 Avr","01 Mai - 30 Juillet","01 Août - 30 Oct","01 Nov - 30 Jan"}
+   residents_pool=c.execute("SELECT id,surname,firstname FROM residents").fetchall()
+   terrain_pool=c.execute("SELECT id,name FROM terrains").fetchall()
+   for row in rows:
+    row_errors=[]
+    resident_name=str(row.get("resident","")).strip(); terrain_name=str(row.get("terrain","")).strip(); year_label=str(row.get("year_label","")).strip()
+    row["resident"]=resident_name; row["terrain"]=terrain_name; row["year_label"]=year_label
+    if not resident_name: row_errors.append("Resident name is required.")
+    if not terrain_name: row_errors.append("Terrain name is required.")
+    if not re.fullmatch(r"\d{4}-\d{4}",year_label) or int(year_label.split("-")[1])!=int(year_label.split("-")[0])+1:
+     row_errors.append("Academic year must use YYYY-YYYY with consecutive years.")
+    resident_matches=[r for r in residents_pool if resident_name.casefold() in {(r["surname"]+" "+r["firstname"]).casefold().strip(),(r["firstname"]+" "+r["surname"]).casefold().strip(),(r["surname"]+", "+r["firstname"]).casefold().strip()}]
+    terrain_matches=[t for t in terrain_pool if t["name"].casefold().strip()==terrain_name.casefold().strip()]
+    if len(resident_matches)!=1: row_errors.append("Resident must match exactly one existing resident; use 'Surname Firstname'.")
+    else: row["resident_id"]=resident_matches[0]["id"]
+    if len(terrain_matches)!=1: row_errors.append("Terrain must match exactly one existing terrain.")
+    else: row["terrain_id"]=terrain_matches[0]["id"]
+    period=str(row.get("period","")).strip(); date_done=str(row.get("date_done","")).strip()
+    if period and period not in valid_periods: row_errors.append("Choose one of the four official periods or leave period blank.")
+    if date_done:
+     try:
+      parsed=date.fromisoformat(date_done)
+      if parsed>date.today(): row_errors.append("A historical rotation date cannot be in the future.")
+     except ValueError: row_errors.append("Date must be a real calendar date in YYYY-MM-DD format.")
+    row["period"]=period; row["date_done"]=date_done
+    key=(row.get("resident_id"),row.get("terrain_id"),year_label,period,date_done)
+    if key in seen: row_errors.append("Duplicate history row in this file.")
+    seen.add(key)
+    if row.get("resident_id") and row.get("terrain_id") and c.execute("SELECT 1 FROM history WHERE resident_id=? AND terrain_id=? AND year_label=? AND COALESCE(period,'')=? AND COALESCE(date_done,'')=?",(row["resident_id"],row["terrain_id"],year_label,period,date_done)).fetchone():
+     row_errors.append("This exact history record already exists.")
+    if row_errors: errors.append({"row":row.get("row_number"),"message":" ".join(row_errors)})
+   rows.sort(key=lambda row:(row.get("year_label",""),row.get("resident","").casefold(),row.get("terrain","").casefold()))
+   c.execute("INSERT INTO import_previews(owner,rows_json,errors_json,filename,import_type) VALUES(?,?,?,?,?)",(session["user"],json.dumps(rows,ensure_ascii=False),json.dumps(errors,ensure_ascii=False),filename,"history"))
+   preview_id=c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.commit(); c.close()
+   return page("""<section><h3>Import documented stage history / Importer l’historique / استيراد التربصات السابقة</h3><p>File: {{filename}} — {{rows|length}} rows. Only explicitly documented stages are imported; no stages are inferred.</p>{% if errors %}<p class="bad">Validation errors: {{errors|length}}. Nothing can be imported until the source is corrected.</p>{% endif %}<div class="wrap"><table><tr><th>Row</th><th>Resident</th><th>Terrain</th><th>Academic year</th><th>Period</th><th>Completion date</th><th>Validation</th></tr>{% for row in rows %}<tr><td>{{row.row_number}}</td><td>{{row.resident}}</td><td>{{row.terrain}}</td><td>{{row.year_label}}</td><td>{{row.period}}</td><td>{{row.date_done}}</td><td>{% for e in errors if e.row==row.row_number %}<span class="bad">{{e.message}}</span>{% else %}<span class="good">OK</span>{% endfor %}</td></tr>{% endfor %}</table></div><form method="post"><input type="hidden" name="preview_id" value="{{preview_id}}"><button name="action" value="confirm" {% if errors %}disabled{% endif %}>Confirm import</button> <button name="action" value="cancel">Cancel</button></form></section>""",filename=filename,rows=rows,errors=errors,preview_id=preview_id)
+  except Exception as exc:
+   c.close(); flash("Could not read/validate history file: "+str(exc)[:220]); return redirect("/import-history")
+  finally:
+   if staged and os.path.exists(staged): os.remove(staged)
+ c.close()
+ return page("""<section><h3>Import documented stage history / Importer l’historique / استيراد التربصات السابقة</h3><p>Upload CSV, XLS/XLSX, DOC/DOCX or text-based PDF with resident, terrain/service, academic year columns; period and completion date are optional. Resident and terrain must match existing records exactly.</p><form method="post" enctype="multipart/form-data"><label>History file</label><input type="file" name="file" accept=".csv,.xls,.xlsx,.doc,.docx,.pdf" required><button>Upload and preview</button></form><p><a href="/import">Back to resident import</a></p></section>""")
+
 @app.get("/photos/<filename>")
 def resident_photo(filename):
  if guard(): return redirect("/login")
@@ -732,24 +1047,66 @@ def resident_profile(rid):
  if not r: c.close(); return ("Resident not found",404)
  if request.method=="POST":
   if session.get("role")!="super_admin": c.close(); return ("Forbidden — Super Admin only",403)
-  photo_path=request.form.get("photo_path","").strip()
+  surname=request.form.get("surname",r["surname"]).strip()
+  firstname=request.form.get("firstname",r["firstname"]).strip()
+  birth_place=request.form.get("birth_place",r["birth_place"] or "").strip()
+  birth_date=request.form.get("birth_date",r["birth_date"] or "").strip()
+  phone=request.form.get("phone",r["phone"] or "").strip()
+  if not surname or not firstname or len(surname)>100 or len(firstname)>100:
+   c.close(); flash("Surname and first name are required and must be at most 100 characters."); return redirect("/profile/"+str(rid))
+  if len(birth_place)>120 or len(phone)>40:
+   c.close(); flash("Birth place must be at most 120 characters and phone at most 40 characters."); return redirect("/profile/"+str(rid))
+  if birth_date:
+   try: parsed_birth_date=date.fromisoformat(birth_date)
+   except ValueError:
+    c.close(); flash("Enter a valid birth date."); return redirect("/profile/"+str(rid))
+   if parsed_birth_date>date.today():
+    c.close(); flash("Birth date cannot be in the future."); return redirect("/profile/"+str(rid))
+  # Keep the stored image unless a new valid upload is explicitly selected.
+  photo_path=(r["photo_path"] or "").strip()
   photo_file=request.files.get("photo")
   if photo_file and photo_file.filename:
    ext=os.path.splitext(secure_filename(photo_file.filename))[1].lower()
-   if ext not in (".png",".jpg",".jpeg",".webp"):
+   expected_formats={".png":"PNG",".jpg":"JPEG",".jpeg":"JPEG",".webp":"WEBP"}
+   if ext not in expected_formats:
     c.close(); flash("Photo must be PNG, JPG or WEBP."); return redirect("/profile/"+str(rid))
    photo_bytes=photo_file.stream.read(4*1024*1024+1); photo_file.stream.seek(0)
-   if len(photo_bytes)>4*1024*1024:
-    c.close(); flash("Photo must be 4 MB or smaller."); return redirect("/profile/"+str(rid))
-   valid_image=(ext==".png" and photo_bytes.startswith(b"\x89PNG\r\n\x1a\n")) or (ext in (".jpg",".jpeg") and photo_bytes.startswith(b"\xff\xd8\xff")) or (ext==".webp" and len(photo_bytes)>12 and photo_bytes.startswith(b"RIFF") and photo_bytes[8:12]==b"WEBP")
-   if not valid_image:
-    c.close(); flash("The uploaded file is not a valid PNG/JPG/WEBP image."); return redirect("/profile/"+str(rid))
+   if not photo_bytes or len(photo_bytes)>4*1024*1024:
+    c.close(); flash("Photo must be non-empty and 4 MB or smaller."); return redirect("/profile/"+str(rid))
+   try:
+    with warnings.catch_warnings():
+     warnings.simplefilter("error", Image.DecompressionBombWarning)
+     with Image.open(io.BytesIO(photo_bytes)) as probe:
+      if probe.format != expected_formats[ext]:
+       raise ValueError("Image format does not match its filename.")
+      probe.verify()
+     with Image.open(io.BytesIO(photo_bytes)) as source:
+      image=ImageOps.exif_transpose(source)
+      image.load()
+      image.thumbnail((1200,1200))
+      output=io.BytesIO()
+      has_alpha="A" in image.getbands()
+      if expected_formats[ext]=="JPEG":
+       image.convert("RGB").save(output,format="JPEG",quality=90,optimize=True)
+      elif expected_formats[ext]=="PNG":
+       image.convert("RGBA" if has_alpha else "RGB").save(output,format="PNG",optimize=True)
+      else:
+       image.convert("RGBA" if has_alpha else "RGB").save(output,format="WEBP",quality=90,method=6)
+      normalized_photo=output.getvalue()
+   except Exception:
+    c.close(); flash("The selected file is not a readable PNG/JPG/WEBP image. Please choose a real photo."); return redirect("/profile/"+str(rid))
    photo_dir=os.path.join(os.path.dirname(os.path.abspath(DB)),"resident_photos"); os.makedirs(photo_dir,exist_ok=True)
-   photo_name="resident_"+str(rid)+"_"+str(int(datetime.now().timestamp()))+ext
-   photo_file.save(os.path.join(photo_dir,photo_name)); photo_path="/photos/"+photo_name
+   photo_name="resident_"+str(rid)+"_"+str(int(time.time()))+"_"+secrets.token_hex(5)+ext
+   target=os.path.join(photo_dir,photo_name); temporary=target+".tmp"
+   try:
+    with open(temporary,"wb") as handle: handle.write(normalized_photo)
+    os.replace(temporary,target)
+   finally:
+    if os.path.exists(temporary): os.remove(temporary)
+   photo_path="/photos/"+photo_name
   c.execute("UPDATE residents SET surname=?,firstname=?,birth_place=?,birth_date=?,photo_path=?,phone=? WHERE id=?",
-   (request.form.get("surname",r["surname"]).strip(),request.form.get("firstname",r["firstname"]).strip(),request.form.get("birth_place","").strip(),request.form.get("birth_date",""),photo_path,request.form.get("phone","").strip(),rid))
-  audit_event(c,"resident.profile_updated",f"resident_id={rid}; name={request.form.get('surname',r['surname']).strip()} {request.form.get('firstname',r['firstname']).strip()}; photo_uploaded={bool(photo_file and photo_file.filename)}")
+   (surname,firstname,birth_place,birth_date,photo_path,phone,rid))
+  audit_event(c,"resident.profile_updated",f"resident_id={rid}; name={surname} {firstname}; photo_uploaded={bool(photo_file and photo_file.filename)}")
   c.commit(); r=c.execute("SELECT * FROM residents WHERE id=?",(rid,)).fetchone(); flash(tr("done"))
  history_rows=c.execute("SELECT h.*,t.name terrain FROM history h JOIN terrains t ON t.id=h.terrain_id WHERE h.resident_id=? ORDER BY h.id DESC",(rid,)).fetchall()
  assignment_rows=c.execute("SELECT a.status,p.name period,p.year_label,t.name terrain FROM assignments a JOIN periods p ON p.id=a.period_id JOIN terrains t ON t.id=a.terrain_id WHERE a.resident_id=? ORDER BY p.year_label DESC,p.id",(rid,)).fetchall()
@@ -757,17 +1114,25 @@ def resident_profile(rid):
  exam_rows=c.execute("SELECT * FROM exam_records WHERE resident_id=? ORDER BY study_year,module",(rid,)).fetchall()
  done={x[0] for x in c.execute("SELECT terrain_id FROM history WHERE resident_id=? UNION SELECT terrain_id FROM assignments WHERE resident_id=? AND status='confirmed'",(rid,rid)).fetchall()}
  terrains=c.execute("SELECT * FROM terrains ORDER BY CASE WHEN kind='optional' THEN 1 ELSE 0 END,name").fetchall(); c.close()
- return page("""<section><h3>{{r.surname}} {{r.firstname}} — Resident profile / Profil / الملف</h3><p>Year: {{r.year}} · Status: {{r.status}}</p>{% if r.photo_path %}<p><img src="{{r.photo_path}}" alt="Resident photo" style="max-width:140px;max-height:140px"></p>{% endif %}<form method="post" enctype="multipart/form-data"><label>{{t('surname')}}</label><input name="surname" value="{{r.surname}}" required><label>{{t('firstname')}}</label><input name="firstname" value="{{r.firstname}}" required><label>Birth place / Lieu de naissance / مكان الميلاد</label><input name="birth_place" value="{{r.birth_place or ''}}"><label>Birth date / Date de naissance / تاريخ الميلاد</label><input type="date" name="birth_date" value="{{r.birth_date or ''}}"><label>Phone / Téléphone / الهاتف</label><input name="phone" value="{{r.phone or ''}}"><label>Photo URL/path / Photo / رابط الصورة</label><input name="photo_path" value="{{r.photo_path or ''}}"><label>Upload photo (PNG/JPG/WEBP, max 4 MB)</label><input type="file" name="photo" accept="image/png,image/jpeg,image/webp"><button>Save / Enregistrer / حفظ</button></form><p><a href="/exams?resident={{r.id}}">Exams / Examens / الامتحانات</a> · <a href="/dems">DEMS archive</a></p></section><section><h3>Terrain progress / Avancement / تقدم التربصات</h3><div class="wrap"><table><tr><th>Terrain</th><th>Status</th></tr>{% for t in terrains %}<tr><td>{{t.name}}</td><td class="{{'bad' if t.id in done else 'good'}}">{{'Completed / Effectué / مكتمل' if t.id in done else 'Remaining / À faire / متبقٍ'}}</td></tr>{% endfor %}</table></div></section><section><h3>Assignments and history / Affectations et historique / التوزيعات والتاريخ</h3>{% for a in assignment_rows %}<p>{{a.year_label}} — {{a.period}} — {{a.terrain}} ({{a.status}})</p>{% endfor %}{% for h in history_rows %}<p>{{h.year_label}} — {{h.period}} — {{h.terrain}} — {{h.date_done}}</p>{% endfor %}</section><section><h3>Exam scores / Notes d’examen / علامات الامتحان</h3><div class="wrap"><table><tr><th>Study year</th><th>Module</th><th>Theory</th><th>Practical</th></tr>{% for e in exam_rows %}<tr><td>{{e.study_year}}</td><td>{{e.module}}</td><td>{{e.theory}}/20</td><td>{{e.practical}}/20</td></tr>{% else %}<tr><td colspan="4">{{t('none')}}</td></tr>{% endfor %}</table></div></section><section><h3>Objectives / Objectifs / الأهداف</h3>{% for o in objectives %}<p>Year {{o.study_year}} — {{o.terrain}}: {{o.objective}}</p>{% else %}<p>{{t('none')}}</p>{% endfor %}</section>""",r=r,terrains=terrains,done=done,assignment_rows=assignment_rows,history_rows=history_rows,objectives=objectives,exam_rows=exam_rows)
+ return page("""<section class="rt-profile-panel"><div class="rt-profile-head"><div class="rt-avatar-wrap">{% if r.photo_path %}<img id="resident-photo-preview" class="rt-profile-avatar" src="{{r.photo_path}}" alt="Resident photo">{% else %}<div id="resident-photo-placeholder" class="rt-profile-avatar rt-avatar-placeholder" aria-label="No resident photo">👤</div><img id="resident-photo-preview" class="rt-profile-avatar" alt="Selected resident photo preview" hidden>{% endif %}</div><div class="rt-profile-heading"><span class="rt-eyebrow">RESIMANAGE · RESIDENT FILE</span><h2>{{r.surname}} {{r.firstname}}</h2><p><span class="rt-chip">Year {{r.year}}</span><span class="rt-chip {{'rt-chip-muted' if r.status!='active' else 'rt-chip-active'}}">{{r.status}}</span></p><p class="muted">Profile, rotation progress, exam results and objectives in one place.</p></div></div><form class="rt-profile-form" method="post" enctype="multipart/form-data" accept-charset="UTF-8"><div class="rt-field-grid"><label>{{t('surname')}}<input name="surname" value="{{r.surname}}" autocomplete="family-name" maxlength="100" required></label><label>{{t('firstname')}}<input name="firstname" value="{{r.firstname}}" autocomplete="given-name" maxlength="100" required></label><label>Birth place / Lieu de naissance / مكان الميلاد<input name="birth_place" value="{{r.birth_place or ''}}" maxlength="120"></label><label>Birth date / Date de naissance / تاريخ الميلاد<input type="date" name="birth_date" value="{{r.birth_date or ''}}"></label><label>Phone / Téléphone / الهاتف<input name="phone" value="{{r.phone or ''}}" type="tel" autocomplete="tel" maxlength="40"></label></div><div class="rt-photo-picker"><label for="resident-photo-input">Resident photo / Photo du résident / صورة المقيم</label><p class="muted">Choose a real PNG, JPG or WEBP image (maximum 4 MB). A preview appears before saving.</p><input id="resident-photo-input" type="file" name="photo" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" aria-describedby="resident-photo-help"><small id="resident-photo-help">The existing photo is kept if you do not select a replacement.</small><small id="resident-photo-status" aria-live="polite"></small></div><div class="rt-savebar"><button type="submit">Save profile / Enregistrer / حفظ الملف</button><a class="rt-secondary-action" href="/residents">Back to residents / Retour / رجوع</a></div></form><p class="rt-profile-links"><a href="/exams?resident={{r.id}}">Exams / Examens / الامتحانات</a><a href="/dems">DEMS archive</a></p></section><section><h3>Terrain progress / Avancement / تقدم التربصات</h3><div class="wrap"><table><tr><th>Terrain</th><th>Status</th></tr>{% for t in terrains %}<tr><td>{{t.name}}</td><td class="{{'bad' if t.id in done else 'good'}}">{{'Completed / Effectué / مكتمل' if t.id in done else 'Remaining / À faire / متبقٍ'}}</td></tr>{% endfor %}</table></div></section><section><h3>Assignments and history / Affectations et historique / التوزيعات والتاريخ</h3>{% for a in assignment_rows %}<p>{{a.year_label}} — {{a.period}} — {{a.terrain}} ({{a.status}})</p>{% endfor %}{% for h in history_rows %}<p>{{h.year_label}} — {{h.period}} — {{h.terrain}} — {{h.date_done}}</p>{% endfor %}</section><section><h3>Exam scores / Notes d’examen / علامات الامتحان</h3><div class="wrap"><table><tr><th>Study year</th><th>Module</th><th>Theory</th><th>Practical</th></tr>{% for e in exam_rows %}<tr><td>{{e.study_year}}</td><td>{{e.module}}</td><td>{{e.theory}}/20</td><td>{{e.practical}}/20</td></tr>{% else %}<tr><td colspan="4">{{t('none')}}</td></tr>{% endfor %}</table></div></section><section><h3>Objectives / Objectifs / الأهداف</h3>{% for o in objectives %}<p>Year {{o.study_year}} — {{o.terrain}}: {{o.objective}}</p>{% else %}<p>{{t('none')}}</p>{% endfor %}</section><script>(function(){const input=document.getElementById('resident-photo-input');const preview=document.getElementById('resident-photo-preview');const placeholder=document.getElementById('resident-photo-placeholder');if(!input||!preview)return;const status=document.getElementById('resident-photo-status');input.addEventListener('change',function(){const file=input.files&&input.files[0];if(!file)return;const allowed=['image/png','image/jpeg','image/webp'];const ext=(file.name.split('.').pop()||'').toLowerCase();if((file.type&&!allowed.includes(file.type))||!['png','jpg','jpeg','webp'].includes(ext)){if(status)status.textContent='Please choose a PNG, JPG or WEBP photo.';input.value='';return;}if(file.size>4*1024*1024){if(status)status.textContent='The photo must be 4 MB or smaller.';input.value='';return;}const reader=new FileReader();reader.onload=function(){preview.src=reader.result;preview.hidden=false;if(placeholder)placeholder.hidden=true;if(status)status.textContent='Preview ready. Save the profile to upload the photo.';};reader.readAsDataURL(file);});})();</script>""",r=r,terrains=terrains,done=done,assignment_rows=assignment_rows,history_rows=history_rows,objectives=objectives,exam_rows=exam_rows)
 @app.route("/objectives",methods=["GET","POST"])
 def manage_objectives():
  if super_guard(): return super_guard()
  c=db()
  if request.method=="POST":
-  tid=int(request.form["terrain"]); sy=int(request.form["study_year"]); obj=request.form["objective"].strip()
-  if obj:
+  try:
+   tid=int(request.form["terrain"]); sy=int(request.form["study_year"]); obj=request.form.get("objective","").strip()
+   terrain=c.execute("SELECT id FROM terrains WHERE id=? AND active=1",(tid,)).fetchone()
+   if not terrain: raise ValueError("Choose an active terrain.")
+   if sy not in (1,2,3,4): raise ValueError("Objective study year must be 1, 2, 3 or 4.")
+   if not obj or len(obj)>1000: raise ValueError("Objective text is required and must be at most 1000 characters.")
+   duplicate=c.execute("SELECT 1 FROM objectives WHERE terrain_id=? AND study_year=? AND lower(objective)=lower(?)",(tid,sy,obj)).fetchone()
+   if duplicate: raise ValueError("This objective already exists for the selected terrain and year.")
    c.execute("INSERT INTO objectives(terrain_id,study_year,objective) VALUES(?,?,?)",(tid,sy,obj))
    audit_event(c,"objective.created",f"terrain_id={tid}; study_year={sy}")
    c.commit(); flash(tr("done"))
+  except (ValueError,TypeError,KeyError,sqlite3.IntegrityError) as exc:
+   c.rollback(); flash(str(exc) or "Invalid objective input.")
  ts=c.execute("SELECT * FROM terrains WHERE active=1 ORDER BY name").fetchall()
  rows=c.execute("SELECT o.*,t.name terrain FROM objectives o JOIN terrains t ON t.id=o.terrain_id ORDER BY study_year,t.name").fetchall(); c.close()
  return page("""<section><h3>{{t('objectives')}}</h3><form method="post"><label>{{t('terrain')}}</label><select name="terrain">{% for t in ts %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select><label>{{t('study_year')}}</label><select name="study_year">{% for y in range(1,5) %}<option>{{y}}</option>{% endfor %}</select><label>{{t('objective')}}</label><input name="objective" required><button>{{t('save')}}</button></form></section><section>{% for o in rows %}<p>Year {{o.study_year}} — {{o.terrain}}: {{o.objective}}</p>{% else %}<p>{{t('none')}}</p>{% endfor %}</section>""",ts=ts,rows=rows)
@@ -776,13 +1141,27 @@ def exams():
  if guard(): return redirect("/login")
  c=db()
  if request.method=="POST":
-  action=request.form.get("action","record"); rid=int(request.form["resident"]); sy=int(request.form["study_year"])
+  action=request.form.get("action","record")
+  try:
+   rid=int(request.form.get("resident",""))
+   sy=int(request.form.get("study_year",""))
+  except (TypeError,ValueError):
+   c.close(); flash("Choose a valid resident and study year."); return redirect("/exams")
   resident=c.execute("SELECT * FROM residents WHERE id=?",(rid,)).fetchone()
   if not resident:
    flash("Resident not found")
   elif action=="record":
-   module=request.form["module"].strip(); theory=float(request.form["theory"]); practical=float(request.form["practical"])
-   if sy not in (1,2,3,4) or not module or not (0<=theory<=20 and 0<=practical<=20):
+   if session.get("role")!="super_admin":
+    c.close(); return ("Forbidden — Super Admin only",403)
+   try:
+    module=request.form.get("module","").strip()
+    theory=float(request.form.get("theory",""))
+    practical=float(request.form.get("practical",""))
+   except (TypeError,ValueError):
+    c.close(); flash("Module and numeric marks from 0 to 20 are required."); return redirect("/exams")
+   if resident["status"]=="graduated" or sy>resident["year"]:
+    flash("Cannot record marks for a future study year or modify a DEMS-graduated resident's archived record.")
+   elif sy not in (1,2,3,4) or not module or not (0<=theory<=20 and 0<=practical<=20):
     flash("Module and marks from 0 to 20 are required")
    else:
     existing=c.execute("SELECT id FROM exam_records WHERE resident_id=? AND study_year=? AND lower(module)=lower(?)",(rid,sy,module)).fetchone()
@@ -797,18 +1176,36 @@ def exams():
    flash("Confirm that all first-year module results have been entered before evaluating progression.")
   elif action=="evaluate_first_year":
    if session.get("role")!="super_admin": c.close(); return ("Forbidden — Super Admin only",403)
-   records=c.execute("SELECT theory,practical FROM exam_records WHERE resident_id=? AND study_year=1",(rid,)).fetchall()
-   if not records:
-    flash("Enter first-year exam modules before evaluation")
+   if resident["year"]!=1:
+    flash("Only current first-year residents can be evaluated for first-year progression.")
+   elif resident["status"]!="active":
+    flash("The resident is inactive; progression is not available.")
    else:
-    average=sum((x["theory"]+x["practical"])/2 for x in records)/len(records)
-    passed=average>=10 and all(x["theory"]>=10 and x["practical"]>=10 for x in records)
-    c.execute("INSERT INTO decisions(details,decision,reason,actor) VALUES(?,?,?,?)",(f"{resident['surname']} {resident['firstname']} — first-year exams","Passed" if passed else "Failed",f"Average={average:.2f}/20; all theory/practical marks >=10: {all(x['theory']>=10 and x['practical']>=10 for x in records)}",session["user"]))
-    audit_event(c,"exam.first_year_evaluated",f"resident_id={rid}; average={average:.2f}; passed={passed}")
-    if passed and resident["year"]==1:
-     c.execute("UPDATE residents SET year=2 WHERE id=?",(rid,))
-     audit_event(c,"resident.year_advanced",f"resident_id={rid}; from=1; to=2")
-    c.commit(); flash(("Passed; resident advanced to year 2." if passed else "Failed: average must be at least 10/20 and every theory/practical mark must be at least 10/20"))
+    records=c.execute("SELECT theory,practical FROM exam_records WHERE resident_id=? AND study_year=1",(rid,)).fetchall()
+    if not records:
+     flash("Enter first-year exam modules before evaluation")
+    else:
+     average=sum((x["theory"]+x["practical"])/2 for x in records)/len(records)
+     passed=average>=10 and all(x["theory"]>=10 and x["practical"]>=10 for x in records)
+     c.execute("INSERT INTO decisions(details,decision,reason,actor) VALUES(?,?,?,?)",(f"{resident['surname']} {resident['firstname']} — first-year exams","Passed" if passed else "Failed",f"Average={average:.2f}/20; all theory/practical marks >=10: {all(x['theory']>=10 and x['practical']>=10 for x in records)}",session["user"]))
+     audit_event(c,"exam.first_year_evaluated",f"resident_id={rid}; average={average:.2f}; passed={passed}")
+     advanced=False
+     if passed and resident["year"]==1 and resident["status"]=="active":
+      c.execute("UPDATE residents SET year=2 WHERE id=? AND year=1 AND status='active'",(rid,))
+      advanced=c.execute("SELECT changes()").fetchone()[0]==1
+      if advanced:
+       audit_event(c,"resident.year_advanced",f"resident_id={rid}; from=1; to=2")
+     c.commit()
+     if not passed:
+      flash("Failed: average must be at least 10/20 and every theory/practical mark must be at least 10/20")
+     elif resident["year"]!=1:
+      flash("Exam criteria passed; no year change because the resident is not currently in year 1.")
+     elif resident["status"]!="active":
+      flash("Exam criteria passed, but the resident is inactive; no progression was applied.")
+     elif advanced:
+      flash("Passed; resident advanced to year 2.")
+     else:
+      flash("Exam criteria passed, but progression was not applied; review the resident record.")
   elif action=="approve_advance":
    actor=session.get("user","").lower()
    outcome=request.form.get("outcome","approve")
@@ -817,8 +1214,10 @@ def exams():
     c.close(); return ("Only the official Super Admins Dr Dris and Pr Benhocine may vote on progression.",403)
    if outcome not in ("approve","reject") or not reason:
     flash("Choose approve/reject and enter the decision reason.")
+   elif resident["status"]!="active":
+    flash("Inactive residents cannot be advanced; no progression vote was recorded.")
    elif sy not in (2,3) or resident["year"]!=sy:
-    flash("Only year 2 or 3 residents can use the dual-official progression vote.")
+    flash("Only active year 2 or 3 residents can use the dual-official progression vote.")
    else:
     c.execute("INSERT INTO promotion_votes(resident_id,from_year,decision,reason,actor) VALUES(?,?,?,?,?) ON CONFLICT(resident_id,from_year,actor) DO UPDATE SET decision=excluded.decision,reason=excluded.reason,created_at=CURRENT_TIMESTAMP",(rid,sy,outcome,reason,actor))
     audit_event(c,"promotion.vote_recorded",f"resident_id={rid}; from_year={sy}; decision={outcome}; reason={reason}")
@@ -863,6 +1262,8 @@ def dems():
   try: success_date=date.fromisoformat(request.form.get("success_date","").strip()).isoformat()
   except ValueError:
    c.close(); flash("Enter a valid DEMS exam date."); return redirect("/dems")
+  if date.fromisoformat(success_date)>date.today():
+   c.close(); flash("The DEMS exam date cannot be in the future."); return redirect("/dems")
   r=c.execute("SELECT * FROM residents WHERE id=? AND year=4 AND status='active'",(rid,)).fetchone()
   if not r or outcome not in ("approve","reject") or not reason:
    flash("Choose an active year-4 resident, a valid vote, a date and a reason.")
@@ -1039,6 +1440,26 @@ def rotation_period_bounds(year_label, period_name):
     if "nov" in n: return date(y,11,1), date(y+1,1,30)
     return date(y,2,1), date(y+1,1,30)
 
+def reject_external_overlap_with_local_assignment(c, resident_id, start, end):
+    local_rows = c.execute(
+        """SELECT a.id,t.name terrain,p.year_label,p.name period
+           FROM assignments a
+           JOIN terrains t ON t.id=a.terrain_id
+           JOIN periods p ON p.id=a.period_id
+           WHERE a.resident_id=? AND a.status IN ('confirmed','pending')""",
+        (resident_id,),
+    ).fetchall()
+    for assignment in local_rows:
+        local_start, local_end = rotation_period_bounds(
+            assignment["year_label"], assignment["period"]
+        )
+        if start <= local_end and end >= local_start:
+            raise ValueError(
+                "External rotation overlaps an existing local assignment: "
+                + assignment["terrain"] + " / " + assignment["period"] + "."
+            )
+
+
 @app.route("/leave", methods=["GET","POST"])
 def leave_management():
     if guard(): return redirect("/login")
@@ -1093,6 +1514,7 @@ def external_rotations():
             if end<start: raise ValueError("Return date must not precede start date.")
             overlap=c.execute("SELECT id FROM external_rotations WHERE resident_id=? AND status<>'cancelled' AND start_date<=? AND end_date>=?",(rid,end.isoformat(),start.isoformat())).fetchone()
             if overlap: raise ValueError("External rotations for this resident cannot overlap.")
+            reject_external_overlap_with_local_assignment(c,rid,start,end)
             status="returned" if end<date.today() else "active"
             c.execute("INSERT INTO external_rotations(resident_id,supervisor,destination,hospital,country,rotation_type,start_date,end_date,notes,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(rid,supervisor,destination,hospital,country,kind,start.isoformat(),end.isoformat(),request.form.get("notes","").strip(),status,session.get("user","")))
             audit_event(c,"external_rotation.created",f"resident_id={rid}; hospital={hospital}; country={country}; start={start}; end={end}")
@@ -1128,6 +1550,7 @@ def edit_external_rotation(xid):
             if end<start: raise ValueError("Return date must not precede start date.")
             overlap=c.execute("SELECT id FROM external_rotations WHERE resident_id=? AND id<>? AND status<>'cancelled' AND start_date<=? AND end_date>=?",(rid,xid,end.isoformat(),start.isoformat())).fetchone()
             if overlap: raise ValueError("External rotations for this resident cannot overlap.")
+            reject_external_overlap_with_local_assignment(c,rid,start,end)
             old=f"resident_id={row['resident_id']}; hospital={row['hospital']}; country={row['country']}; start={row['start_date']}; end={row['end_date']}"
             status="returned" if end<date.today() else "active"
             c.execute("UPDATE external_rotations SET resident_id=?,supervisor=?,destination=?,hospital=?,country=?,rotation_type=?,start_date=?,end_date=?,notes=?,status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(rid,supervisor,destination,hospital,country,kind,start.isoformat(),end.isoformat(),request.form.get("notes","").strip(),status,xid))

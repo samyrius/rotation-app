@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_resistage_launcher"
+        android:icon="@drawable/resimanage_3d_launcher"
         android:label="ResiManage"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
